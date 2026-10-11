@@ -1,0 +1,78 @@
+name: Check rsedit
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple silicon
+            runner: macos-14
+            os: macos
+          - name: Linux x64
+            runner: ubuntu-22.04
+            os: linux
+          - name: Windows x64
+            runner: windows-2025
+            os: windows
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: ci-${{ matrix.runner }}
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential file libayatana-appindicator3-dev libgtk-3-dev \
+            libssl-dev libwebkit2gtk-4.1-dev libxdo-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Validate release metadata
+        run: node .github/scripts/check-release.mjs
+
+      - name: Check frontend and Rust
+        run: npm run check
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Check Rust warnings
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

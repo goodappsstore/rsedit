@@ -1,0 +1,29 @@
+[package]
+name = "rsedit"
+version = "0.1.0"
+description = "A fast, focused text editor with a Rust file engine"
+repository = "https://github.com/goodappsstore/rsedit"
+homepage = "https://goodapps.store/rsedit/"
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "rsedit_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+memchr = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

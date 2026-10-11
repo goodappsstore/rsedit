@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local editor window and native file dialogs",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-set-title", "core:window:allow-destroy", "core:window:allow-close", "dialog:allow-open", "dialog:allow-save", "dialog:allow-confirm"]
+}

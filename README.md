@@ -184,9 +184,10 @@ Rust file handling, sessions, and native commands live in `src-tauri/src/`.
 
 ## Releases
 
-[CI](.github/workflows/ci.yml) checks pushes and pull requests on macOS, Windows,
-and Linux. The [release workflow](.github/workflows/release.yml) builds six
-native targets and publishes after verifying all twelve installers. Failures
+[CI](.github/workflows/ci.yml) checks tag pushes on macOS, Windows, and Linux.
+Branch pushes, pull requests, and manual dispatches do not trigger workflows.
+The [release workflow](.github/workflows/release.yml) runs only on `v*` tag pushes,
+builds six native targets, and publishes after verifying all twelve installers. Failures
 leave a draft; published installers require a new version to replace.
 
 Before pushing a `vMAJOR.MINOR.PATCH` tag, align the version in `package.json`,

@@ -1,6 +1,6 @@
 //! Hot exit snapshots. The index is replaced only after every buffer is synced.
 use crate::{
-    document::{Document, Info, SavedDocument},
+    document::{Document, Info, SavedDocument, SnapshotSources},
     Editor,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,10 @@ pub struct TabView {
     pub scroll_top: f64,
     pub scroll_left: f64,
     pub language_override: Option<String>,
+    #[serde(default)]
+    pub indent: Option<String>,
+    #[serde(default)]
+    pub tab_size: Option<u8>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +77,8 @@ struct StoreState {
     loaded: bool,
     unrestored_open: Vec<SavedTab>,
     unrestored_closed: Vec<SavedTab>,
+    sources: SnapshotSources,
+    snapshots: std::collections::HashMap<u64, ((u64, bool), SavedDocument)>,
 }
 pub struct SessionStore {
     directory: PathBuf,
@@ -115,7 +121,7 @@ impl SessionStore {
                 format!("Could not read the previous session. Its buffers have been preserved: {e}")
             })?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => SavedSession {
-                version: 1,
+                version: 2,
                 open: vec![],
                 closed: vec![],
                 active_index: 0,
@@ -123,7 +129,7 @@ impl SessionStore {
             },
             Err(e) => return Err(err(e)),
         };
-        if saved.version != 1 {
+        if ![1, 2].contains(&saved.version) {
             return Err(
                 "Unrecognized session format. The previous session has been preserved.".into(),
             );
@@ -137,6 +143,13 @@ impl SessionStore {
                 match Document::recover(editor.id(), &entry.document, &self.directory) {
                     Ok(doc) => {
                         let info = doc.info();
+                        if entry.document.buffer.is_some() || entry.document.pieces.is_some() {
+                            state.sources.register_recovery(&doc, &entry.document);
+                            state.snapshots.insert(
+                                info.id,
+                                ((info.revision, info.dirty), entry.document.clone()),
+                            );
+                        }
                         entry.view.id = info.id;
                         editor.insert(doc)?;
                         if closed {
@@ -207,17 +220,25 @@ impl SessionStore {
             .position(|tab| Some(tab.id) == view.active)
             .unwrap_or(0);
         let mut saved = SavedSession {
-            version: 1,
+            version: 2,
             open: vec![],
             closed: vec![],
             active_index,
             folder: view.folder,
         };
+        let mut sources = state.sources.clone();
+        let mut snapshots = std::collections::HashMap::new();
         for (closed, entries) in [(false, view.open), (true, view.closed)] {
             for tab in entries {
                 let shared = editor.get(tab.id)?;
-                let doc = shared.lock().map_err(err)?;
-                let document = doc.snapshot(stage.path(), relative)?;
+                // Capture immutable pieces briefly; disk streaming must not block editing.
+                let doc = shared.lock().map_err(err)?.clone();
+                let key = doc.checkpoint_key()?;
+                let document = match state.snapshots.get(&tab.id) {
+                    Some((prior_key, saved)) if *prior_key == key => saved.clone(),
+                    _ => doc.snapshot(stage.path(), relative, &mut sources)?,
+                };
+                snapshots.insert(tab.id, (key, document.clone()));
                 let entry = SavedTab {
                     document,
                     view: tab,
@@ -241,12 +262,21 @@ impl SessionStore {
         index
             .persist(self.directory.join("session.json"))
             .map_err(err)?;
+        state.snapshots = snapshots;
+        let paths = saved
+            .open
+            .iter()
+            .chain(&saved.closed)
+            .flat_map(|tab| tab.document.buffers().cloned())
+            .collect();
+        sources.retain(&paths);
+        state.sources = sources;
         // Only reclaim generations absent from the newly committed manifest.
         let keep: std::collections::HashSet<_> = saved
             .open
             .iter()
             .chain(&saved.closed)
-            .filter_map(|tab| tab.document.buffer.as_ref())
+            .flat_map(|tab| tab.document.buffers())
             .filter_map(|path| path.components().next())
             .map(|c| c.as_os_str().to_os_string())
             .collect();

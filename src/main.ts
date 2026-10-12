@@ -4,11 +4,11 @@ import type { Text } from '@codemirror/state';
 import { EditorView, keymap } from '@codemirror/view';
 import type { ViewUpdate } from '@codemirror/view';
 import { Compartment } from '@codemirror/state';
-import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, setSearchQuery, SearchQuery, gotoLine } from '@codemirror/search';
+import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, setSearchQuery, SearchQuery, gotoLine, selectSelectionMatches } from '@codemirror/search';
 import { indentUnit } from '@codemirror/language';
-import { undo, redo, toggleComment, selectAll } from '@codemirror/commands';
+import { undo, redo, toggleComment, selectAll, copyLineDown, moveLineUp, moveLineDown, deleteLine } from '@codemirror/commands';
 import { call, desktop, formatBytes } from './api';
-import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession } from './api';
+import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, ExternalChange, QuickOpen, ReplaceResult } from './api';
 import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, wrapSlot } from './editor';
 import { createFolderPanel } from './folders';
 
@@ -18,6 +18,7 @@ interface Tab {
   pageStart: number;
   pageEnd: number;
   syncedDoc: Text;
+  savedDoc?: Text;
   pending: boolean;
   busy: boolean;
   language: string;
@@ -29,6 +30,9 @@ interface Tab {
   loaded: boolean;
   savedView?: TabView;
   loading?: Promise<void>;
+  indent: string;
+  tabSize: number;
+  externalToken?: string;
 }
 interface Preferences { theme: 'dark' | 'light'; wrap: boolean; indent: number; fontSize: number }
 interface Command { label: string; shortcut?: string; run: () => void | Promise<void> }
@@ -53,6 +57,9 @@ let startupPromise: Promise<void> | undefined;
 let active: Tab | undefined;
 let nextUntitled = 0;
 let shuttingDown = false;
+let sessionReady = false;
+let checkpointPromise: Promise<void> | undefined;
+let checkingExternal = false;
 const lockSlot = new Compartment();
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
@@ -78,7 +85,7 @@ app.innerHTML = `
   <div class="notice" role="status" hidden><span></span><button aria-label="Dismiss notification">×</button></div>
   <main class="workspace">
     <div class="pagebar" hidden>
-      <strong>Large file</strong><span class="range"></span>
+      <strong>Large-file view</strong><span class="range"></span>
       <button data-page="previous" title="Previous section">← Previous</button>
       <button data-page="next" title="Next section">Next →</button>
       <input class="byte-offset" type="number" min="0" step="1" aria-label="Go to byte offset" placeholder="Byte offset" />
@@ -86,7 +93,8 @@ app.innerHTML = `
     </div>
     <section class="large-search" aria-label="Search entire large file" hidden>
       <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
-      <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: restore position. Case-sensitive whole-file search.</p>
+      <div class="search-row"><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with (literal text)" /><button data-search="replace-all">Replace all in entire file</button></div>
+      <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: restore position. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
       
     </section>
     <div class="editor-host"></div>
@@ -95,7 +103,7 @@ app.innerHTML = `
   </div>
   <footer class="statusbar">
     <span class="path"></span><span class="position"></span>
-    <span class="size"></span><span class="encoding">UTF-8</span><span class="eol"></span>
+    <span class="recovery" role="status"></span><span class="size"></span><span class="encoding">UTF-8</span><span class="eol"></span>
     <button data-action="indent" title="Change indentation size"></button>
     <button data-action="language" title="Select syntax language"></button>
   </footer>
@@ -136,8 +144,13 @@ function remember(path: string | null): void {
   recentPaths = [path, ...recentPaths.filter(p => p !== path)].slice(0, 20);
   try { localStorage.setItem('rsedit.recent', JSON.stringify(recentPaths)); } catch { /* Nonessential. */ }
 }
-function dirty(tab: Tab): boolean { return tab.pending || tab.info.dirty; }
+function dirty(tab: Tab): boolean {
+  return !tab.info.paged && tab.savedDoc ? !tab.state.doc.eq(tab.savedDoc) : tab.pending || tab.info.dirty;
+}
 const shortcuts = keymap.of([
+  { key: 'Mod-z', run: () => { void safely(() => history(false)); return true; } },
+  { key: 'Mod-Shift-z', run: () => { void safely(() => history(true)); return true; } },
+  { key: 'Mod-y', run: () => { void safely(() => history(true)); return true; } },
   { key: 'Mod-n', run: () => { void safely(newTab); return true; } },
   { key: 'Mod-o', run: () => { void safely(openFiles); return true; } },
   { key: 'Mod-Alt-o', run: () => { void safely(folders.open); return true; } },
@@ -171,13 +184,29 @@ function changed(update: ViewUpdate): void {
       origin.byteOffset = active.pageStart + new TextEncoder().encode(update.state.sliceDoc(0, origin.selection.main.head)).length;
     }
     active.pending = !update.state.doc.eq(active.syncedDoc);
+    if (sessionReady && !checkpointPromise) element('.recovery').textContent = 'Recovery pending';
     cancelSearch();
     element('.match-count').textContent = 'Search changed; press Enter to search again.';
     renderTabs();
   }
   if (update.selectionSet || update.docChanged) renderStatus();
 }
-function options() { return { wrap: preferences.wrap, indent: preferences.indent, changed, shortcuts }; }
+function options(tab?: Pick<Tab, 'indent' | 'tabSize'>) {
+  return { wrap: preferences.wrap, indent: tab?.indent ?? ' '.repeat(preferences.indent), tabSize: tab?.tabSize ?? preferences.indent, changed, shortcuts };
+}
+function detectIndent(text: string): { indent: string; tabSize: number } {
+  let tabs = 0;
+  const widths = new Map<number, number>();
+  for (const line of text.slice(0, 64 * 1024).split('\n')) {
+    if (/^\t[ \t]*\S/.test(line)) tabs++;
+    const spaces = /^( +)\S/.exec(line)?.[1].length;
+    if (spaces && spaces <= 32) widths.set(spaces, (widths.get(spaces) ?? 0) + 1);
+  }
+  const spaces = [...widths.values()].reduce((sum, n) => sum + n, 0);
+  if (tabs > spaces) return { indent: '\t', tabSize: preferences.indent };
+  const width = [8, 4, 2].find(n => widths.size > 0 && [...widths.keys()].every(w => w % n === 0)) ?? preferences.indent;
+  return { indent: ' '.repeat(width), tabSize: width };
+}
 function lockExtension(busy: boolean) { return [EditorState.readOnly.of(busy), EditorView.editable.of(!busy)]; }
 function applyEffect(tab: Tab, effects: StateEffect<unknown> | readonly StateEffect<unknown>[]): void {
   if (active === tab) view.dispatch({ effects });
@@ -198,9 +227,10 @@ function installPage(tab: Tab, page: Page): void {
   tab.info = page.info;
   tab.pageStart = page.start;
   tab.pageEnd = page.end;
-  tab.state = makeState(page, options());
+  tab.state = makeState(page, options(tab));
   tab.state = tab.state.update({ effects: StateEffect.appendConfig.of(lockSlot.of(lockExtension(tab.busy))) }).state;
   tab.syncedDoc = tab.state.doc;
+  if (!page.info.dirty) tab.savedDoc = tab.state.doc;
   tab.pending = false;
   tab.loaded = true;
   tab.scrollTop = tab.scrollLeft = 0;
@@ -213,10 +243,13 @@ async function addPage(page: Page): Promise<void> {
     info: page.info, state: makeState(page, options()), pageStart: page.start, pageEnd: page.end,
     syncedDoc: EditorState.create().doc, pending: false, busy: false,
     language: 'Plain text', languageGeneration: 0, previous: [], scrollTop: 0, scrollLeft: 0, loaded: true,
+    ...detectIndent(page.text),
   };
   if (!tab.info.path) tab.info.name = `Untitled ${++nextUntitled}`;
   tab.state = tab.state.update({ effects: StateEffect.appendConfig.of(lockSlot.of(lockExtension(false))) }).state;
   tab.syncedDoc = tab.state.doc;
+  if (!page.info.dirty) tab.savedDoc = tab.state.doc;
+  applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(tab.tabSize)]));
   tabs.push(tab);
   activate(tab);
   remember(tab.info.path);
@@ -231,6 +264,8 @@ function restoredTab(entry: RestoredTab): Tab {
     language: 'Plain text', languageGeneration: 0, languageOverride: entry.view.languageOverride ?? undefined,
     previous: [], scrollTop: entry.view.scrollTop, scrollLeft: entry.view.scrollLeft,
     loaded: false, savedView: entry.view,
+    indent: entry.view.indent === '\t' ? '\t' : /^ {2}$|^ {4}$|^ {8}$/.test(entry.view.indent ?? '') ? entry.view.indent! : ' '.repeat(preferences.indent),
+    tabSize: [2, 4, 8].includes(entry.view.tabSize ?? 0) ? entry.view.tabSize! : preferences.indent,
   };
   if (!tab.info.path) {
     tab.info.name = entry.view.name;
@@ -239,12 +274,12 @@ function restoredTab(entry: RestoredTab): Tab {
   return tab;
 }
 function captureTabView(tab: Tab): TabView {
-  if (!tab.loaded && tab.savedView) return { ...tab.savedView, id: tab.info.id, name: tab.info.name, languageOverride: tab.languageOverride ?? null };
+  if (!tab.loaded && tab.savedView) return { ...tab.savedView, id: tab.info.id, name: tab.info.name, languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
   const selection = tab.state.selection.main;
   return { id: tab.info.id, name: tab.info.name, pageStart: tab.pageStart, anchor: selection.anchor, head: selection.head,
     scrollTop: active === tab ? view.scrollDOM.scrollTop : tab.scrollTop,
     scrollLeft: active === tab ? view.scrollDOM.scrollLeft : tab.scrollLeft,
-    languageOverride: tab.languageOverride ?? null };
+    languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
 }
 function applySavedView(tab: Tab, saved: TabView): void {
   if (!tab.info.path) tab.info.name = saved.name;
@@ -265,6 +300,7 @@ async function ensureLoaded(tab: Tab): Promise<void> {
   tab.loading = locked(tab, async () => {
     const saved = tab.savedView;
     const page = await call<Page>('read_page', { id: tab.info.id, offset: saved?.pageStart ?? 0 });
+    if (!saved?.indent) Object.assign(tab, detectIndent(page.text));
     installPage(tab, page);
     if (saved) applySavedView(tab, saved);
     tab.savedView = undefined;
@@ -272,8 +308,10 @@ async function ensureLoaded(tab: Tab): Promise<void> {
   return tab.loading;
 }
 function reopenClosedTab(): Promise<void> {
+  const checkpointBeforeHistory = checkpointPromise;
   historyQueue = historyQueue.catch(() => {}).then(async () => {
     await startupPromise?.catch(() => {});
+    await checkpointBeforeHistory?.catch(() => {});
     if (shuttingDown) return;
     const tab = closedTabs.at(-1);
     if (!tab) { notify('No closed files to reopen.'); return; }
@@ -320,7 +358,7 @@ async function loadLanguage(tab: Tab, languageName?: string): Promise<void> {
     let extension;
     let name;
     // Syntax parsing enormous physical lines is unnecessary work in large-file mode.
-    if ((!tab.info.path && !languageName) || languageName === 'Plain text' || (tab.info.paged && tab.state.doc.lines < tab.state.doc.length / 32768)) {
+    if ((!languageName && tab.info.size > 4 * 1024 * 1024) || (!tab.info.path && !languageName) || languageName === 'Plain text' || (tab.info.paged && tab.state.doc.lines < tab.state.doc.length / 32768)) {
       extension = []; name = 'Plain text';
     } else if (languageName) {
       const { languages } = await import('@codemirror/language-data');
@@ -381,7 +419,7 @@ function renderStatus(): void {
   element('.position').textContent = `${tab.info.paged ? 'Section ' : ''}Ln ${line.number}, Col ${selection.head - line.from + 1}${selected ? ` · ${selected} selected` : ''}`;
   element('.size').textContent = formatBytes(tab.info.size);
   element('.eol').textContent = tab.info.eol;
-  element('[data-action=indent]').textContent = `Spaces: ${preferences.indent}`;
+  element('[data-action=indent]').textContent = tab.indent === '\t' ? `Tabs: ${tab.tabSize}` : `Spaces: ${tab.indent.length}`;
   element('[data-action=language]').textContent = tab.language;
   pagebar.hidden = !tab.info.paged;
   if (tab.info.paged) {
@@ -398,12 +436,16 @@ async function openPath(path: string): Promise<void> {
   if (existing) { activate(existing); return; }
   if (opening.has(path)) return;
   opening.add(path);
+  const started = performance.now();
   try {
     const page = await call<Page>('open_document', { path });
     const duplicate = tabs.find(t => t.info.path === page.info.path);
     if (duplicate) { await call('close_document', { id: page.info.id }); activate(duplicate); return; }
     await addPage(page);
-    if (page.info.paged) notify('Large-file mode: editable sections, bounded memory. Undo and line numbers apply to the current section.');
+    if (desktop) requestAnimationFrame(() => requestAnimationFrame(() => {
+      void call('file_view_ready', { id: page.info.id, elapsedMs: performance.now() - started }).catch(() => {});
+    }));
+    if (page.info.paged) notify('Opened a bounded view for fast browsing. Edits save the entire file; undo spans views. Use Find for whole-file literal replacement. Line numbers and selections are view-relative.');
     else notice.hidden = true;
   } finally { opening.delete(path); }
 }
@@ -416,7 +458,21 @@ async function openFiles(): Promise<void> {
 async function flush(tab: Tab, force = false): Promise<void> {
   if (!tab.pending && !force) return;
   const text = tab.state.sliceDoc();
-  const info = await call<Info>('replace_range', { id: tab.info.id, start: tab.pageStart, end: tab.pageEnd, text, revision: tab.info.revision });
+  const prior = tab.syncedDoc.sliceString(0, tab.syncedDoc.length, tab.info.eol === 'CRLF' ? '\r\n' : '\n');
+  let from = 0;
+  let beforeEnd = prior.length;
+  let afterEnd = text.length;
+  if (!force) {
+    while (from < beforeEnd && from < afterEnd && prior[from] === text[from]) from++;
+    // Do not split a surrogate pair or the separator used by the document.
+    if (from && (/[\uDC00-\uDFFF]/.test(text[from] ?? '') || (text[from - 1] === '\r' && text[from] === '\n'))) from--;
+    while (beforeEnd > from && afterEnd > from && prior[beforeEnd - 1] === text[afterEnd - 1]) { beforeEnd--; afterEnd--; }
+    if (afterEnd < text.length && (/[\uDC00-\uDFFF]/.test(text[afterEnd]) || (text[afterEnd - 1] === '\r' && text[afterEnd] === '\n'))) { beforeEnd++; afterEnd++; }
+  }
+  const encoder = new TextEncoder();
+  const start = tab.pageStart + encoder.encode(prior.slice(0, from)).length;
+  const end = tab.pageStart + encoder.encode(prior.slice(0, beforeEnd)).length;
+  const info = await call<Info>('replace_range', { id: tab.info.id, start, end, text: text.slice(from, afterEnd), revision: tab.info.revision, markClean: !tab.info.paged && !!tab.savedDoc && tab.state.doc.eq(tab.savedDoc) });
   tab.info = { ...info, name: info.path ? info.name : tab.info.name };
   tab.pageEnd = tab.pageStart + new TextEncoder().encode(text).length;
   tab.syncedDoc = tab.state.doc;
@@ -435,8 +491,10 @@ async function saveTab(tab: Tab | undefined, saveAs = false): Promise<boolean> {
       if (!path) return false;
       if (tabs.some(other => other !== tab && other.info.path === path)) throw new Error('This destination is already open in another tab. Choose another path.');
     }
+    notify(`Saving the entire ${tab.info.name} (${formatBytes(tab.info.size)})…`);
     await flush(tab, saveAs && !tab.info.paged);
     tab.info = await call<Info>('save_document', { id: tab.info.id, path });
+    tab.savedDoc = tab.state.doc;
     remember(tab.info.path);
     void loadLanguage(tab);
     if (active === tab) notify(`Saved ${tab.info.name}.`);
@@ -460,8 +518,10 @@ async function approveClose(tab: Tab): Promise<boolean> {
 }
 function closeTab(tab: Tab | undefined): Promise<void> {
   if (!tab) return Promise.resolve();
+  const checkpointBeforeHistory = checkpointPromise;
   historyQueue = historyQueue.catch(() => {}).then(async () => {
     await startupPromise?.catch(() => {});
+    await checkpointBeforeHistory?.catch(() => {});
     if (shuttingDown || !tabs.includes(tab)) return;
     await tab.loading?.catch(() => {});
     await locked(tab, async () => {
@@ -492,14 +552,16 @@ function closeTab(tab: Tab | undefined): Promise<void> {
   });
   return historyQueue;
 }
-async function reloadTab(): Promise<void> {
-  const tab = active;
+async function reloadTab(tab = active): Promise<void> {
+  await checkpointPromise?.catch(() => {});
   if (!tab?.info.path) return;
   await locked(tab, async () => {
     if (!await approveDiscard(tab)) return;
     const page = await call<Page>('open_document', { path: tab.info.path });
     await call('close_document', { id: tab.info.id });
-    tab.previous = [];
+    hideLargeSearch(); sectionOrigin = undefined;
+    tab.previous = []; tab.externalToken = undefined;
+    Object.assign(tab, detectIndent(page.text));
     installPage(tab, page);
     notify(`Reloaded ${tab.info.name} from disk.`);
   });
@@ -557,6 +619,9 @@ function updateSectionCount(update?: ViewUpdate): void {
     if (generation !== sectionCountGeneration || active !== tab) return;
     const panel = element('.editor-host').querySelector('.cm-search');
     if (!panel) return;
+    let scope = panel.querySelector('.search-scope');
+    if (!scope) { scope = document.createElement('div'); scope.className = 'search-scope search-hint'; panel.prepend(scope); }
+    scope.textContent = tab?.info.paged ? 'Visible view only (including Replace all). Use whole-file search for literal replacement across the file.' : 'Entire file';
     let counter = panel.querySelector<HTMLSpanElement>('.section-match-count');
     if (!counter) {
       counter = document.createElement('span'); counter.className = 'section-match-count match-count';
@@ -607,7 +672,7 @@ function showLargeSearch(): void {
 }
 function find(): void {
   if (!active) return;
-  if (active.info.paged && largeSearch.hidden && !searchPanelOpen(view.state)) showLargeSearch();
+  if (active.info.paged) showLargeSearch();
   else openSectionSearch();
 }
 function cancelSearch(): void {
@@ -733,10 +798,74 @@ function toggleWrap(): void {
   for (const tab of tabs) applyEffect(tab, wrapSlot.reconfigure(preferences.wrap ? EditorView.lineWrapping : []));
   storePreferences();
 }
+function setIndent(indent: string, tabSize: number): void {
+  const tab = active;
+  if (!tab) return;
+  tab.indent = indent; tab.tabSize = tabSize;
+  applyEffect(tab, indentSlot.reconfigure([indentUnit.of(indent), EditorState.tabSize.of(tabSize)]));
+  renderStatus();
+}
 function changeIndent(): void {
-  preferences.indent = preferences.indent === 2 ? 4 : preferences.indent === 4 ? 8 : 2;
-  for (const tab of tabs) applyEffect(tab, indentSlot.reconfigure([indentUnit.of(' '.repeat(preferences.indent)), EditorState.tabSize.of(preferences.indent)]));
-  storePreferences(); renderStatus();
+  showPalette([
+    ...[2, 4, 8].map(width => ({ label: `Use ${width} spaces for this file`, run: () => setIndent(' '.repeat(width), width) })),
+    ...[2, 4, 8].map(width => ({ label: `Use literal tabs (display width ${width}) for this file`, run: () => setIndent('\t', width) })),
+    { label: 'Convert leading indentation to spaces in entire file', run: () => convertIndent(false) },
+    { label: 'Convert leading indentation to tabs in entire file', run: () => convertIndent(true) },
+  ], 'Indentation for this file…');
+}
+async function history(forward: boolean): Promise<void> {
+  const tab = active;
+  if (!tab || tab.busy) return;
+  if (!tab.info.paged) { (forward ? redo : undo)(view); return; }
+  await locked(tab, async () => {
+    cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+    await flush(tab);
+    const page = await call<Page>('document_history', { id: tab.info.id, redo: forward, offset: tab.pageStart, revision: tab.info.revision });
+    installPage(tab, page);
+  });
+}
+async function replaceEntireFile(): Promise<void> {
+  const tab = active;
+  if (!tab?.info.paged || !queryInput.value) return;
+  const query = queryInput.value;
+  const replacement = element<HTMLInputElement>('.large-replacement').value;
+  await locked(tab, async () => {
+    cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+    notify(`Replacing literal text in the entire ${tab.info.name}. Your file is written only when you Save…`);
+    await flush(tab);
+    const result = await call<ReplaceResult>('replace_entire_file', { id: tab.info.id, query, replacement, revision: tab.info.revision });
+    installPage(tab, result.page);
+    notify(`Replaced ${result.count.toLocaleString()} matches across the entire file. Undo is available; Save writes the result.`);
+  });
+}
+async function convertIndent(tabsMode: boolean): Promise<void> {
+  const tab = active;
+  if (!tab || tab.busy) return;
+  const width = tab.tabSize;
+  if (tab.info.paged) {
+    await locked(tab, async () => {
+      cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+      notify(`Converting indentation across the entire ${tab.info.name}…`);
+      await flush(tab);
+      const page = await call<Page>('convert_document_indent', { id: tab.info.id, tabs: tabsMode, width, revision: tab.info.revision });
+      installPage(tab, page);
+      notify('Converted indentation in the entire file. Undo is available; Save writes the result.');
+    });
+  } else {
+    const changes = [];
+    for (let number = 1; number <= tab.state.doc.lines; number++) {
+      const line = tab.state.doc.line(number);
+      const leading = /^[ \t]+/.exec(line.text)?.[0];
+      if (!leading) continue;
+      let columns = 0;
+      for (const char of leading) columns += char === '\t' ? width - columns % width : 1;
+      const insert = tabsMode ? '\t'.repeat(Math.floor(columns / width)) + ' '.repeat(columns % width) : ' '.repeat(columns);
+      if (insert !== leading) changes.push({ from: line.from, to: line.from + leading.length, insert });
+    }
+    view.dispatch({ changes, userEvent: 'input.indent' });
+  }
+  if (active === tab) setIndent(tabsMode ? '\t' : ' '.repeat(width), width);
+  else { tab.indent = tabsMode ? '\t' : ' '.repeat(width); applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(width)])); }
 }
 function zoom(delta: number): void { preferences.fontSize = Math.min(28, Math.max(10, preferences.fontSize + delta)); storePreferences(); view.requestMeasure(); }
 function toggleTheme(): void { preferences.theme = preferences.theme === 'dark' ? 'light' : 'dark'; storePreferences(); view.requestMeasure(); }
@@ -744,6 +873,24 @@ function toggleTheme(): void { preferences.theme = preferences.theme === 'dark' 
 let paletteCommands: Command[] = [];
 let filteredCommands: Command[] = [];
 let paletteIndex = 0;
+let filePalette = false;
+let quickOpenGeneration = 0;
+let quickOpenInFlight = false;
+let quickOpenPending = false;
+let quickOpenTimer: ReturnType<typeof setTimeout> | undefined;
+function fuzzyScore(value: string, query: string): number | undefined {
+  if (!query) return -value.length;
+  value = value.toLowerCase().replaceAll('\\', '/');
+  query = query.toLowerCase().replaceAll('\\', '/');
+  let at = 0, score = 0, run = 0;
+  for (let index = 0; index < value.length; index++) {
+    if (value[index] === query[at]) {
+      score += 20 + ++run * 8 + (index === 0 || /[/_.\- ]/.test(value[index - 1]) ? 30 : 0) - index;
+      if (++at === query.length) return score - value.length;
+    } else run = 0;
+  }
+  return undefined;
+}
 function commands(): Command[] {
   return [
     { label: 'New file', shortcut: `${mod}N`, run: newTab },
@@ -754,35 +901,72 @@ function commands(): Command[] {
     { label: 'Close folder panel', run: folders.close },
     { label: 'Save file', shortcut: `${mod}S`, run: async () => { await saveTab(active); } },
     { label: 'Save file as…', shortcut: `${mod}⇧S`, run: async () => { await saveTab(active, true); } },
-    { label: 'Reload file from disk', run: reloadTab },
+    { label: 'Reload file from disk', run: () => reloadTab() },
     { label: 'Save all files', run: async () => { for (const tab of [...tabs]) if (dirty(tab) && !await saveTab(tab)) break; } },
     { label: 'Reopen closed file', shortcut: `${mod}⇧T`, run: reopenClosedTab },
     { label: 'Close file', shortcut: `${mod}W`, run: () => closeTab(active) },
-    { label: 'Find / replace in current section', shortcut: `${mod}F`, run: () => { openSectionSearch(); } },
-    ...(active?.info.paged ? [{ label: 'Search entire file', run: showLargeSearch }] : []),
-    { label: 'Go to line (current section)', shortcut: `${mod}G`, run: () => { gotoLine(view); } },
-    { label: 'Undo', shortcut: `${mod}Z`, run: () => { undo(view); } },
-    { label: 'Redo', shortcut: `${mod}⇧Z`, run: () => { redo(view); } },
-    { label: 'Select all (current section)', shortcut: `${mod}A`, run: () => { selectAll(view); } },
+    { label: active?.info.paged ? 'Find / replace literal text in entire file' : 'Find / replace in entire file', shortcut: `${mod}F`, run: find },
+    ...(active?.info.paged ? [{ label: 'Find / replace in visible view only', shortcut: `${mod}H`, run: () => { openSectionSearch(); } }] : []),
+    { label: active?.info.paged ? 'Go to line (visible view)' : 'Go to line', shortcut: `${mod}G`, run: () => { gotoLine(view); } },
+    { label: 'Undo', shortcut: `${mod}Z`, run: () => history(false) },
+    { label: 'Redo', shortcut: `${mod}⇧Z`, run: () => history(true) },
+    { label: active?.info.paged ? 'Select all in visible view' : 'Select all', shortcut: `${mod}A`, run: () => { selectAll(view); } },
+    { label: 'Duplicate line', shortcut: 'Alt+Shift+↓', run: () => { copyLineDown(view); } },
+    { label: 'Move line up', shortcut: 'Alt+↑', run: () => { moveLineUp(view); } },
+    { label: 'Move line down', shortcut: 'Alt+↓', run: () => { moveLineDown(view); } },
+    { label: 'Delete line', shortcut: `${mod}⇧K`, run: () => { deleteLine(view); } },
+    { label: active?.info.paged ? 'Select all occurrences in visible view' : 'Select all occurrences', shortcut: `${mod}⇧L`, run: () => { selectSelectionMatches(view); } },
     { label: 'Toggle line comment', shortcut: `${mod}/`, run: () => { toggleComment(view); } },
     { label: `${preferences.wrap ? 'Disable' : 'Enable'} word wrap`, shortcut: `${mod}⇧W`, run: toggleWrap },
     { label: `Switch to ${preferences.theme === 'dark' ? 'light' : 'dark'} theme`, run: toggleTheme },
-    { label: 'Change indentation: 2 / 4 / 8 spaces', run: changeIndent },
+    { label: 'Set or convert indentation for this file…', run: changeIndent },
     { label: 'Increase font size', shortcut: `${mod}+`, run: () => zoom(1) },
     { label: 'Decrease font size', shortcut: `${mod}−`, run: () => zoom(-1) },
     { label: 'Select syntax language…', run: showLanguages },
-    { label: 'Switch file…', shortcut: `${mod}P`, run: showFiles },
+    { label: 'Quick-open folder files and tabs…', shortcut: `${mod}P`, run: showFiles },
     ...recentPaths.map(path => ({ label: `Open recent: ${path}`, run: () => openPath(path) })),
   ];
 }
 function showPalette(items: Command[], placeholder = 'Type a command…'): void {
+  filePalette = false; ++quickOpenGeneration; clearTimeout(quickOpenTimer);
+  element('.palette footer').textContent = '↑ ↓ to navigate · Enter to run · Esc to close';
   paletteCommands = items; paletteIndex = 0;
   paletteQuery.value = ''; paletteQuery.placeholder = placeholder;
   overlay.hidden = false; renderPalette(); paletteQuery.focus();
 }
 function showCommands(): void { showPalette(commands()); }
+function tabCommands(): Command[] {
+  return tabs.map(tab => ({ label: `${dirty(tab) ? '● ' : ''}${tab.info.name}`, shortcut: tab.info.path ?? '', run: () => activate(tab) }));
+}
 function showFiles(): void {
-  showPalette(tabs.map(tab => ({ label: `${dirty(tab) ? '● ' : ''}${tab.info.name}`, shortcut: tab.info.path ?? '', run: () => activate(tab) })), 'Switch to a file…');
+  showPalette(tabCommands(), 'Quick-open: fuzzy folder path or open tab…');
+  filePalette = true;
+  renderPalette();
+  void updateQuickOpen();
+}
+async function updateQuickOpen(): Promise<void> {
+  if (quickOpenInFlight) { quickOpenPending = true; return; }
+  const generation = ++quickOpenGeneration;
+  const root = folders.capture()?.path;
+  if (!filePalette || overlay.hidden) return;
+  if (!root) { paletteCommands = tabCommands(); renderPalette(); return; }
+  element('.palette footer').textContent = 'Searching folder on demand…';
+  quickOpenInFlight = true; quickOpenPending = false;
+  try {
+    const results = await call<QuickOpen>('quick_open', { path: root, query: paletteQuery.value.trim() });
+    if (generation !== quickOpenGeneration || !filePalette || overlay.hidden) return;
+    const open = new Set(tabs.map(tab => tab.info.path));
+    paletteCommands = [...tabCommands(), ...results.entries.filter(entry => !open.has(entry.path)).map(entry => ({ label: entry.name, shortcut: '', run: () => openPath(entry.path) }))];
+    element('.palette footer').textContent = `${results.truncated ? 'Partial results: scan reached 50,000 entries or 1 second. ' : ''}${results.skippedDirectories ? `${results.skippedDirectories} unreadable directories skipped. ` : ''}Excludes .git, node_modules, target and directory symlinks. ↑ ↓ · Enter · Esc`;
+    renderPalette();
+  } catch (error) {
+    if (generation !== quickOpenGeneration || !filePalette || overlay.hidden) return;
+    element('.palette footer').textContent = `Folder search failed: ${String(error)}. Open tabs are available.`;
+    paletteCommands = tabCommands(); renderPalette();
+  } finally {
+    quickOpenInFlight = false;
+    if (quickOpenPending && filePalette && !overlay.hidden) void updateQuickOpen();
+  }
 }
 async function showLanguages(): Promise<void> {
   const tab = active;
@@ -790,10 +974,14 @@ async function showLanguages(): Promise<void> {
   const { languages } = await import('@codemirror/language-data');
   showPalette(['Plain text', ...languages.map(l => l.name)].map(name => ({ label: name, run: () => loadLanguage(tab, name) })), 'Select a syntax language…');
 }
-function closePalette(): void { overlay.hidden = true; view.focus(); }
+function closePalette(): void { overlay.hidden = true; filePalette = false; quickOpenPending = false; ++quickOpenGeneration; clearTimeout(quickOpenTimer); view.focus(); }
 function renderPalette(): void {
   const query = paletteQuery.value.toLowerCase();
-  filteredCommands = paletteCommands.filter(command => command.label.toLowerCase().includes(query));
+  filteredCommands = filePalette
+    ? paletteCommands.map(command => ({ command, score: fuzzyScore(`${command.label} ${command.shortcut ?? ''}`, query.trim()) }))
+      .filter((item): item is { command: Command; score: number } => item.score !== undefined)
+      .sort((a, b) => b.score - a.score).slice(0, 80).map(item => item.command)
+    : paletteCommands.filter(command => command.label.toLowerCase().includes(query));
   paletteIndex = Math.min(paletteIndex, Math.max(0, filteredCommands.length - 1));
   element('.palette-list').replaceChildren(...filteredCommands.map((command, index) => {
     const button = document.createElement('button'); button.className = `palette-item${index === paletteIndex ? ' selected' : ''}`;
@@ -843,6 +1031,7 @@ byteOffset.addEventListener('keydown', event => { if (event.key === 'Enter') voi
 largeSearch.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-search]')?.dataset.search;
   if (action === 'start') void safely(() => searchLarge());
+  if (action === 'replace-all') void safely(replaceEntireFile);
   if (action === 'close') void safely(resetLargeSearch);
 });
 queryInput.addEventListener('keydown', event => {
@@ -857,7 +1046,13 @@ document.addEventListener('keydown', event => {
   if (!largeSearch.hidden) { event.preventDefault(); event.stopPropagation(); void safely(resetLargeSearch); }
   else if (searchPanelOpen(view.state)) { event.preventDefault(); event.stopPropagation(); resetSectionSearch(); }
 }, true);
-paletteQuery.addEventListener('input', () => { paletteIndex = 0; renderPalette(); });
+paletteQuery.addEventListener('input', () => {
+  paletteIndex = 0; renderPalette();
+  if (filePalette) {
+    ++quickOpenGeneration; clearTimeout(quickOpenTimer);
+    quickOpenTimer = setTimeout(() => { void updateQuickOpen(); }, 150);
+  }
+});
 paletteQuery.addEventListener('keydown', event => {
   if (event.key === 'Escape') { event.preventDefault(); closePalette(); }
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -886,6 +1081,60 @@ tabbar.addEventListener('keydown', event => {
 });
 window.addEventListener('beforeunload', event => { if (!desktop && tabs.some(dirty)) event.preventDefault(); });
 
+function sessionView() {
+  return { open: tabs.map(captureTabView), closed: closedTabs.map(captureTabView), active: active?.info.id ?? null, folder: folders.capture() };
+}
+function checkpoint(): Promise<void> {
+  if (checkpointPromise) return checkpointPromise;
+  if (!sessionReady || shuttingDown) return Promise.resolve();
+  const historyBeforeCheckpoint = historyQueue;
+  checkpointPromise = (async () => {
+    await historyBeforeCheckpoint.catch(() => {});
+    if (shuttingDown || opening.size || [...tabs, ...closedTabs].some(tab => tab.busy)) return;
+    const buffers = [...tabs, ...closedTabs];
+    const status = element('.recovery');
+    status.textContent = 'Checkpointing…';
+    try {
+      for (const tab of buffers) if (tab.pending) await locked(tab, () => flush(tab));
+      await call('persist_session', { view: sessionView() });
+      status.textContent = [...tabs, ...closedTabs].some(tab => tab.pending) ? 'Recovery saved · newer edits pending' : 'Recovery saved';
+      status.title = `Last successful recovery checkpoint: ${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+      status.textContent = 'Recovery failed';
+      notify(`Recovery checkpoint failed. The previous checkpoint is preserved: ${String(error)}`, true);
+    }
+  })().finally(() => { checkpointPromise = undefined; });
+  return checkpointPromise;
+}
+async function checkExternalChanges(): Promise<void> {
+  if (!sessionReady || shuttingDown || checkingExternal) return;
+  checkingExternal = true;
+  try {
+    for (const tab of [...tabs]) {
+      if (!tab.info.path || tab.busy || shuttingDown || !tabs.includes(tab)) continue;
+      const change = await call<ExternalChange>('check_external_change', { id: tab.info.id });
+      if (!change.changed) { tab.externalToken = undefined; continue; }
+      if (tab.externalToken === change.token) continue;
+      tab.externalToken = change.token;
+      if (!dirty(tab)) {
+        await reloadTab(tab);
+        continue;
+      }
+      if (!tabs.includes(tab) || tab.busy || shuttingDown) continue;
+      activate(tab);
+      showPalette([
+        { label: 'Keep my edits and review the disk change later', run: () => { notify(`${tab.info.name} changed on disk. Save As can preserve fully loaded or recovered content; disk-backed views need the unchanged source. Copy visible edits before reloading.`); } },
+        { label: 'Save my buffer to another file…', run: async () => { await saveTab(tab, true); } },
+        { label: 'Copy visible text to a new recovery tab', run: async () => {
+          const text = tab.state.sliceDoc(); await newTab(); view.dispatch({ changes: { from: 0, insert: text } });
+          notify('Copied the visible text to an unsaved buffer. The original tab is still open.');
+        } },
+        { label: 'Reload disk file (asks before discarding edits)', run: () => reloadTab(tab) },
+      ], `${tab.info.name} changed on disk — choose how to recover`);
+      break;
+    }
+  } finally { checkingExternal = false; }
+}
 async function initializeDesktop(): Promise<void> {
   if (!desktop) return;
   const [{ getCurrentWindow }, { listen }] = await Promise.all([import('@tauri-apps/api/window'), import('@tauri-apps/api/event')]);
@@ -901,6 +1150,7 @@ async function initializeDesktop(): Promise<void> {
       cancelSearch();
       let lockedTabs: Tab[] = [];
       try {
+        await checkpointPromise?.catch(() => {});
         await startupPromise?.catch(() => {});
         await historyQueue.catch(() => {});
         await folders.settle();
@@ -911,7 +1161,7 @@ async function initializeDesktop(): Promise<void> {
         for (const tab of lockedTabs) { tab.busy = true; applyEffect(tab, lockSlot.reconfigure(lockExtension(true))); }
         notify('Preserving session…');
         for (const tab of lockedTabs) await flush(tab);
-        await call('persist_session', { view: { open: tabs.map(captureTabView), closed: closedTabs.map(captureTabView), active: active?.info.id ?? null, folder: folders.capture() } });
+        await call('persist_session', { view: sessionView() });
         await nativeWindow.destroy();
       } catch (error) {
         throw new Error(`Could not finish preserving and closing the session. The editor remains open: ${String(error)}`);
@@ -921,19 +1171,26 @@ async function initializeDesktop(): Promise<void> {
       }
     });
   });
-  await listen<string>('editor-menu', event => {
+  await listen<{ id: number; done: number; total: number }>('document-progress', event => {
+    const progress = event.payload;
+    const tab = tabs.find(tab => tab.info.id === progress.id);
+    if (tab && tab === active && tab.busy) notify(`Processing the entire file: ${progress.total ? Math.floor(progress.done / progress.total * 100) : 100}% (${formatBytes(progress.done)} of ${formatBytes(progress.total)}). You can switch tabs.`);
+  });
+  await nativeWindow.onFocusChanged(event => { if (event.payload) void safely(checkExternalChanges); });
+  await listen<string>('editor-menu' , event => {
     const action = event.payload;
     if (action === 'quit') void nativeWindow.close();
     else if (action === 'save-as') void safely(async () => { await saveTab(active, true); });
     else if (action === 'theme') toggleTheme();
     else if (action === 'close') void safely(() => closeTab(active));
-    else if (action === 'undo') { undo(view); }
-    else if (action === 'redo') { redo(view); }
+    else if (action === 'undo') void safely(() => history(false));
+    else if (action === 'redo') void safely(() => history(true));
     else if (actions[action]) void safely(actions[action]);
   });
   await listen<string[]>('editor-open', event => { void safely(async () => { for (const path of event.payload) await safely(() => openPath(path)); }); });
   try {
     const restored = await call<RestoredSession>('restore_session');
+    sessionReady = true;
     tabs.push(...restored.open.map(restoredTab));
     closedTabs.push(...restored.closed.map(restoredTab));
     await folders.restore(restored.folder);
@@ -948,6 +1205,8 @@ async function initializeDesktop(): Promise<void> {
   if (!tabs.length) await newTab();
   const paths = await call<string[]>('startup_paths');
   for (const path of paths) await safely(() => openPath(path));
+  setInterval(() => { void checkpoint(); }, 30_000);
+  setTimeout(() => { void checkpoint(); void safely(checkExternalChanges); }, 1000);
 }
 storePreferences();
 if (desktop) { startupPromise = initializeDesktop(); void safely(() => startupPromise!); }

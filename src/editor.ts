@@ -58,7 +58,8 @@ const theme = EditorView.theme({
 
 export interface EditorOptions {
   wrap: boolean;
-  indent: number;
+  indent: string;
+  tabSize: number;
   changed: (update: ViewUpdate) => void;
   shortcuts: Extension;
 }
@@ -73,7 +74,7 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
       // CodeMirror represents lines internally; sliceDoc restores this separator.
       EditorState.lineSeparator.of(page.info.eol === 'CRLF' ? '\r\n' : '\n'),
       languageSlot.of([]), wrapSlot.of(options.wrap ? EditorView.lineWrapping : []),
-      indentSlot.of([indentUnit.of(' '.repeat(options.indent)), EditorState.tabSize.of(options.indent)]),
+      indentSlot.of([indentUnit.of(options.indent), EditorState.tabSize.of(options.tabSize)]),
       syntaxHighlighting(colors), syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       ...(page.info.paged ? [] : [
         bracketMatching(), closeBrackets(), indentOnInput(), foldGutter(),

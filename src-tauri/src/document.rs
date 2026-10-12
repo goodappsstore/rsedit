@@ -10,13 +10,13 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
-pub const SMALL_LIMIT: u64 = 4 * 1024 * 1024;
+pub const SMALL_LIMIT: u64 = 64 * 1024 * 1024;
 pub const PAGE_SIZE: u64 = 256 * 1024;
 const IO_SIZE: u64 = 1024 * 1024;
 
 #[derive(Clone)]
 enum Source {
-    Disk(Arc<File>),
+    Disk(Arc<File>, Stamp),
     Edit(Arc<Vec<u8>>),
 }
 #[derive(Clone)]
@@ -42,6 +42,23 @@ impl Stamp {
     }
 }
 
+impl Source {
+    fn disk(file: File) -> Result<Self, String> {
+        let stamp = Stamp::from_metadata(&file.metadata().map_err(err)?)?;
+        Ok(Self::Disk(Arc::new(file), stamp))
+    }
+}
+
+#[derive(Clone)]
+struct EditState {
+    pieces: Vec<Piece>,
+    size: u64,
+    version: u64,
+    offset: u64,
+    recovered: bool,
+}
+
+#[derive(Clone)]
 pub struct Document {
     pub id: u64,
     path: Option<PathBuf>,
@@ -54,6 +71,10 @@ pub struct Document {
     bom: bool,
     eol: &'static str,
     recovered: bool,
+    undo: Vec<EditState>,
+    redo: Vec<EditState>,
+    version: u64,
+    saved_version: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SavedDocument {
@@ -65,6 +86,78 @@ pub struct SavedDocument {
     bom: bool,
     eol: String,
     pub buffer: Option<PathBuf>,
+    #[serde(default)]
+    pub pieces: Option<Vec<SavedPiece>>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SavedPiece {
+    buffer: PathBuf,
+    start: u64,
+    len: u64,
+}
+impl SavedDocument {
+    pub fn buffers(&self) -> impl Iterator<Item = &PathBuf> {
+        self.buffer
+            .iter()
+            .chain(self.pieces.iter().flatten().map(|piece| &piece.buffer))
+    }
+}
+#[derive(Clone, Default)]
+pub struct SnapshotSources {
+    sources: std::collections::HashMap<usize, (Source, PathBuf)>,
+}
+impl SnapshotSources {
+    pub fn register_recovery(&mut self, doc: &Document, saved: &SavedDocument) {
+        let buffers: Vec<_> = if let Some(pieces) = &saved.pieces {
+            pieces.iter().map(|piece| piece.buffer.clone()).collect()
+        } else {
+            saved.buffer.iter().cloned().collect()
+        };
+        for (piece, path) in doc.pieces.iter().zip(buffers) {
+            let key = match &piece.source {
+                Source::Disk(file, _) => Arc::as_ptr(file) as usize,
+                Source::Edit(bytes) => Arc::as_ptr(bytes) as usize,
+            };
+            self.sources.insert(key, (piece.source.clone(), path));
+        }
+    }
+    pub fn retain(&mut self, paths: &std::collections::HashSet<PathBuf>) {
+        self.sources.retain(|_, (_, path)| paths.contains(path));
+    }
+    fn copy(
+        &mut self,
+        source: &Source,
+        directory: &Path,
+        relative: &Path,
+    ) -> Result<PathBuf, String> {
+        let key = match source {
+            Source::Disk(file, _) => Arc::as_ptr(file) as usize,
+            Source::Edit(bytes) => Arc::as_ptr(bytes) as usize,
+        };
+        if let Some((_, path)) = self.sources.get(&key) {
+            return Ok(path.clone());
+        }
+        let name = format!("source-{}.bin", self.sources.len());
+        let mut output = File::create(directory.join(&name)).map_err(err)?;
+        match source {
+            Source::Disk(file, _) => {
+                let length = file.metadata().map_err(err)?.len();
+                let mut buffer = vec![0; IO_SIZE as usize];
+                let mut offset = 0;
+                while offset < length {
+                    let count = (length - offset).min(IO_SIZE) as usize;
+                    read_exact_at(file, &mut buffer[..count], offset)?;
+                    output.write_all(&buffer[..count]).map_err(err)?;
+                    offset += count as u64;
+                }
+            }
+            Source::Edit(bytes) => output.write_all(bytes).map_err(err)?,
+        }
+        output.sync_all().map_err(err)?;
+        let path = relative.join(name);
+        self.sources.insert(key, (source.clone(), path.clone()));
+        Ok(path)
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,6 +229,18 @@ fn read_exact_at(file: &File, buffer: &mut [u8], mut offset: u64) -> Result<(), 
     Ok(())
 }
 
+fn validate_buffer_path(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("Invalid session buffer path.".into());
+    }
+    Ok(())
+}
+
 impl Document {
     pub fn empty(id: u64) -> Self {
         Self {
@@ -150,6 +255,10 @@ impl Document {
             bom: false,
             eol: "LF",
             recovered: false,
+            undo: vec![],
+            redo: vec![],
+            version: 0,
+            saved_version: Some(0),
         }
     }
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
@@ -182,7 +291,7 @@ impl Document {
             path: Some(path),
             stamp: Some(Stamp::from_metadata(&metadata)?),
             pieces: vec![Piece {
-                source: Source::Disk(Arc::new(file)),
+                source: Source::disk(file)?,
                 start,
                 len: size,
             }],
@@ -191,6 +300,10 @@ impl Document {
             dirty: false,
             paged: size > SMALL_LIMIT,
             recovered: false,
+            undo: vec![],
+            redo: vec![],
+            version: 0,
+            saved_version: Some(0),
             bom,
             eol: if sample.windows(2).any(|b| b == b"\r\n") {
                 "CRLF"
@@ -204,9 +317,17 @@ impl Document {
                 .map_err(|_| "This file is not valid UTF-8 text.".to_string())?;
             doc.paged = bytes
                 .split(|b| *b == b'\n')
-                .any(|line| line.len() > 32 * 1024);
+                .any(|line| line.len() > 1024 * 1024);
+            if !doc.paged {
+                // Fully loaded buffers remain rescuable with Save As after an external edit.
+                doc.pieces = vec![Piece {
+                    source: Source::Edit(Arc::new(bytes)),
+                    start: 0,
+                    len: size,
+                }];
+            }
         }
-        doc.check_source()?;
+        doc.check_original()?;
         Ok(doc)
     }
     pub fn info(&self) -> Info {
@@ -228,11 +349,24 @@ impl Document {
         }
     }
     fn check_source(&self) -> Result<(), String> {
+        // History can retain old open handles after Save As or atomic replacement.
+        // Check each handle's own stamp, not just the current document pathname.
+        let mut checked = std::collections::HashSet::new();
+        for piece in &self.pieces {
+            if let Source::Disk(file, stamp) = &piece.source {
+                if piece.len > 0
+                    && checked.insert(Arc::as_ptr(file) as usize)
+                    && Stamp::from_metadata(&file.metadata().map_err(err)?)? != *stamp
+                {
+                    return Err("A disk source used by this buffer or undo history changed. Keep the current buffer; reload or use a completed recovery copy.".into());
+                }
+            }
+        }
         if !self.recovered
             && self
                 .pieces
                 .iter()
-                .any(|p| p.len > 0 && matches!(p.source, Source::Disk(_)))
+                .any(|p| p.len > 0 && matches!(p.source, Source::Disk(..)))
         {
             self.check_original()?;
         }
@@ -241,10 +375,78 @@ impl Document {
     fn check_original(&self) -> Result<(), String> {
         if let (Some(path), Some(stamp)) = (&self.path, &self.stamp) {
             if &Stamp::read(path)? != stamp {
-                return Err("This file changed on disk. For a fully loaded file, use Save As to keep your edits. A disk-backed large file must be reopened; copy any pending section edits first.".into());
+                return Err("This file changed on disk. Keep your buffer and use Save As, or reload from disk. Disk-backed content cannot be read safely after an external change; copy visible pending edits before reloading.".into());
             }
         }
         Ok(())
+    }
+    pub fn external_change(&self) -> (bool, String) {
+        let (Some(path), Some(stamp)) = (&self.path, &self.stamp) else {
+            return (false, String::new());
+        };
+        match Stamp::read(path) {
+            Ok(current) => (
+                current != *stamp,
+                format!("{}:{:?}", current.size, current.modified),
+            ),
+            Err(error) => (true, error),
+        }
+    }
+    pub fn checkpoint_key(&self) -> Result<(u64, bool), String> {
+        self.check_source()?;
+        Ok((self.revision, self.dirty))
+    }
+    fn edit_state(&self, offset: u64) -> EditState {
+        EditState {
+            pieces: self.pieces.clone(),
+            size: self.size,
+            version: self.version,
+            offset,
+            recovered: self.recovered,
+        }
+    }
+    fn remember_edit(&mut self, offset: u64) {
+        if self.paged {
+            self.undo.push(self.edit_state(offset));
+            self.redo.clear();
+        }
+    }
+    fn finish_edit(&mut self) {
+        self.revision += 1;
+        self.version = self.revision;
+        self.dirty = true;
+    }
+    pub fn history(&mut self, redo: bool, offset: u64, revision: u64) -> Result<Page, String> {
+        if revision != self.revision {
+            return Err("The document changed before undo could be applied.".into());
+        }
+        self.check_source()?;
+        let saved = if redo {
+            self.redo.last()
+        } else {
+            self.undo.last()
+        };
+        if let Some(saved) = saved.cloned() {
+            let mut candidate = self.clone();
+            candidate.pieces = saved.pieces;
+            candidate.size = saved.size;
+            candidate.version = saved.version;
+            candidate.recovered = saved.recovered;
+            candidate.revision += 1;
+            candidate.dirty = candidate.saved_version != Some(candidate.version);
+            let page = candidate.page(saved.offset)?;
+            let current = self.edit_state(offset);
+            if redo {
+                candidate.redo.pop();
+                candidate.undo.push(current);
+            } else {
+                candidate.undo.pop();
+                candidate.redo.push(current);
+            }
+            *self = candidate;
+            return Ok(page);
+        }
+        self.page(offset)
     }
     fn read_range(&self, start: u64, len: u64) -> Result<Vec<u8>, String> {
         if start > self.size || len > self.size - start {
@@ -260,7 +462,7 @@ impl Document {
                 let count = (piece.len - local_start).min(len - written as u64) as usize;
                 let dest = &mut output[written..written + count];
                 match &piece.source {
-                    Source::Disk(file) => read_exact_at(file, dest, piece.start + local_start)?,
+                    Source::Disk(file, _) => read_exact_at(file, dest, piece.start + local_start)?,
                     Source::Edit(bytes) => dest.copy_from_slice(
                         &bytes[(piece.start + local_start) as usize
                             ..(piece.start + local_start) as usize + count],
@@ -289,7 +491,7 @@ impl Document {
         if start > 0 && start < self.size && self.read_range(start - 1, 2)? == b"\r\n" {
             start += 1;
         }
-        let limit = if self.paged { PAGE_SIZE } else { SMALL_LIMIT };
+        let limit = if self.paged { PAGE_SIZE } else { self.size };
         let mut bytes = self.read_range(start, (self.size - start).min(limit))?;
         if start + (bytes.len() as u64) < self.size {
             // Back up at most 3 bytes for the last, incomplete scalar.
@@ -319,6 +521,17 @@ impl Document {
             info: self.info(),
         })
     }
+    pub fn load_page(&mut self, offset: u64) -> Result<Page, String> {
+        let page = self.page(offset)?;
+        if !self.paged {
+            self.pieces = vec![Piece {
+                source: Source::Edit(Arc::new(page.text.as_bytes().to_vec())),
+                start: 0,
+                len: self.size,
+            }];
+        }
+        Ok(page)
+    }
     pub fn replace(
         &mut self,
         start: u64,
@@ -328,6 +541,9 @@ impl Document {
     ) -> Result<Info, String> {
         if revision != self.revision {
             return Err("The document changed before this edit could be applied.".into());
+        }
+        if start != 0 || end != self.size {
+            self.check_source()?;
         }
         if start > end || end > self.size {
             return Err("Invalid edit range.".into());
@@ -340,6 +556,7 @@ impl Document {
                 return Err("An edit cannot split a UTF-8 character.".into());
             }
         }
+        self.remember_edit(start);
         let replacement_len = text.len() as u64;
         let mut next = Vec::new();
         let mut logical = 0;
@@ -381,9 +598,16 @@ impl Document {
         }
         self.pieces = next;
         self.size = self.size - (end - start) + replacement_len;
-        self.revision += 1;
-        self.dirty = true;
+        self.finish_edit();
         Ok(self.info())
+    }
+    pub fn mark_clean(&mut self) {
+        // The fully loaded frontend retains the saved text across checkpoints.
+        // It calls this only when that text equals the current document again.
+        if !self.paged {
+            self.dirty = false;
+            self.saved_version = Some(self.version);
+        }
     }
     fn write_content(&self, output: &mut File) -> Result<(), String> {
         self.check_source()?;
@@ -398,7 +622,7 @@ impl Document {
                         .write_all(&bytes[piece.start as usize..(piece.start + piece.len) as usize])
                         .map_err(err)?;
                 }
-                Source::Disk(file) => {
+                Source::Disk(file, _) => {
                     let mut local = 0;
                     while local < piece.len {
                         let count = (piece.len - local).min(IO_SIZE) as usize;
@@ -417,8 +641,27 @@ impl Document {
         &self,
         directory: &Path,
         relative_directory: &Path,
+        sources: &mut SnapshotSources,
     ) -> Result<SavedDocument, String> {
-        let buffer = if self.dirty || self.path.is_none() {
+        self.check_source()?;
+        let pieces = if self.paged && self.dirty {
+            let pieces = self
+                .pieces
+                .iter()
+                .map(|piece| {
+                    Ok(SavedPiece {
+                        buffer: sources.copy(&piece.source, directory, relative_directory)?,
+                        start: piece.start,
+                        len: piece.len,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            self.check_source()?;
+            Some(pieces)
+        } else {
+            None
+        };
+        let buffer = if pieces.is_none() && (self.dirty || self.path.is_none()) {
             let name = format!("buffer-{}.txt", self.id);
             let mut file = File::create(directory.join(&name)).map_err(err)?;
             self.write_content(&mut file)?;
@@ -435,11 +678,67 @@ impl Document {
             bom: self.bom,
             eol: self.eol.into(),
             buffer,
+            pieces,
         })
     }
     pub fn recover(id: u64, saved: &SavedDocument, directory: &Path) -> Result<Self, String> {
         if saved.size > 9_007_199_254_740_991 {
             return Err("Invalid session buffer size.".into());
+        }
+        if let Some(saved_pieces) = &saved.pieces {
+            let mut pieces = Vec::new();
+            let mut size = 0u64;
+            let mut files = std::collections::HashMap::new();
+            for piece in saved_pieces {
+                validate_buffer_path(&piece.buffer)?;
+                let file = match files.get(&piece.buffer) {
+                    Some(file) => Arc::clone(file),
+                    None => {
+                        let file =
+                            Arc::new(File::open(directory.join(&piece.buffer)).map_err(err)?);
+                        files.insert(piece.buffer.clone(), Arc::clone(&file));
+                        file
+                    }
+                };
+                if piece
+                    .start
+                    .checked_add(piece.len)
+                    .is_none_or(|end| end > file.metadata().map(|meta| meta.len()).unwrap_or(0))
+                {
+                    return Err("A recovery source is truncated or invalid.".into());
+                }
+                size = size
+                    .checked_add(piece.len)
+                    .ok_or("Invalid recovery size.")?;
+                pieces.push(Piece {
+                    source: Source::Disk(
+                        Arc::clone(&file),
+                        Stamp::from_metadata(&file.metadata().map_err(err)?)?,
+                    ),
+                    start: piece.start,
+                    len: piece.len,
+                });
+            }
+            if size != saved.size {
+                return Err("Invalid recovery piece lengths.".into());
+            }
+            return Ok(Self {
+                id,
+                path: saved.path.clone(),
+                stamp: saved.stamp.clone(),
+                pieces,
+                size,
+                revision: 0,
+                dirty: saved.dirty,
+                paged: true,
+                bom: saved.bom,
+                eol: if saved.eol == "CRLF" { "CRLF" } else { "LF" },
+                recovered: true,
+                undo: vec![],
+                redo: vec![],
+                version: 0,
+                saved_version: if saved.dirty { None } else { Some(0) },
+            });
         }
         let Some(buffer) = &saved.buffer else {
             let path = saved
@@ -450,13 +749,7 @@ impl Document {
             doc.paged |= saved.paged;
             return Ok(doc);
         };
-        if buffer.is_absolute()
-            || !buffer
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
-        {
-            return Err("Invalid session buffer path.".into());
-        }
+        validate_buffer_path(buffer)?;
         let file = File::open(directory.join(buffer)).map_err(err)?;
         let expected = saved
             .size
@@ -470,7 +763,7 @@ impl Document {
             path: saved.path.clone(),
             stamp: saved.stamp.clone(),
             pieces: vec![Piece {
-                source: Source::Disk(Arc::new(file)),
+                source: Source::disk(file)?,
                 start: if saved.bom { 3 } else { 0 },
                 len: saved.size,
             }],
@@ -481,6 +774,10 @@ impl Document {
             bom: saved.bom,
             eol: if saved.eol == "CRLF" { "CRLF" } else { "LF" },
             recovered: true,
+            undo: vec![],
+            redo: vec![],
+            version: 0,
+            saved_version: if saved.dirty { None } else { Some(0) },
         })
     }
     pub fn save(&mut self, target: Option<PathBuf>) -> Result<Info, String> {
@@ -535,14 +832,191 @@ impl Document {
         let file = temp.persist(&target).map_err(err)?;
         self.stamp = Some(Stamp::from_metadata(&file.metadata().map_err(err)?)?);
         self.path = Some(target);
-        self.pieces = vec![Piece {
-            source: Source::Disk(Arc::new(file)),
-            start: if self.bom { 3 } else { 0 },
-            len: self.size,
-        }];
+        if self.paged {
+            self.pieces = vec![Piece {
+                source: Source::disk(file)?,
+                start: if self.bom { 3 } else { 0 },
+                len: self.size,
+            }];
+        } else {
+            let bytes = self.read_range(0, self.size)?;
+            self.pieces = vec![Piece {
+                source: Source::Edit(Arc::new(bytes)),
+                start: 0,
+                len: self.size,
+            }];
+        }
         self.dirty = false;
+        self.saved_version = Some(self.version);
+        self.revision += 1;
         self.recovered = false;
         Ok(self.info())
+    }
+    pub fn convert_indent(
+        &mut self,
+        tabs: bool,
+        width: u8,
+        revision: u64,
+        progress: impl Fn(u64, u64),
+    ) -> Result<Page, String> {
+        if ![2, 4, 8].contains(&width) || revision != self.revision {
+            return Err("Invalid indentation or stale revision.".into());
+        }
+        self.check_source()?;
+        let mut output = tempfile::tempfile().map_err(err)?;
+        let mut writer = io::BufWriter::with_capacity(IO_SIZE as usize, &mut output);
+        let mut cursor = 0;
+        let mut columns = 0u64;
+        let mut leading = true;
+        let mut size = 0;
+        let width = width as u64;
+        while cursor < self.size {
+            let bytes = self.read_range(cursor, (self.size - cursor).min(IO_SIZE))?;
+            let mut copied = 0;
+            for (index, byte) in bytes.iter().enumerate() {
+                if leading {
+                    if *byte == b' ' || *byte == b'\t' {
+                        columns += if *byte == b'\t' {
+                            width - columns % width
+                        } else {
+                            1
+                        };
+                        copied = index + 1;
+                        continue;
+                    }
+                    let (mut count, byte) = if tabs {
+                        (columns / width, b'\t')
+                    } else {
+                        (columns, b' ')
+                    };
+                    let block = [byte; 4096];
+                    while count > 0 {
+                        let n = count.min(block.len() as u64) as usize;
+                        writer.write_all(&block[..n]).map_err(err)?;
+                        size += n as u64;
+                        count -= n as u64;
+                    }
+                    if tabs {
+                        let rest = columns % width;
+                        writer.write_all(&[b' '; 8][..rest as usize]).map_err(err)?;
+                        size += rest;
+                    }
+                    columns = 0;
+                    leading = false;
+                }
+                if *byte == b'\n' {
+                    writer.write_all(&bytes[copied..=index]).map_err(err)?;
+                    size += (index + 1 - copied) as u64;
+                    copied = index + 1;
+                    leading = true;
+                }
+            }
+            writer.write_all(&bytes[copied..]).map_err(err)?;
+            size += (bytes.len() - copied) as u64;
+            cursor += bytes.len() as u64;
+            if cursor % (16 * IO_SIZE) == 0 || cursor == self.size {
+                progress(cursor, self.size);
+            }
+        }
+        // Preserve a final whitespace-only line without buffering its length.
+        let (mut count, byte) = if tabs {
+            (columns / width, b'\t')
+        } else {
+            (columns, b' ')
+        };
+        let block = [byte; 4096];
+        while count > 0 {
+            let n = count.min(4096) as usize;
+            writer.write_all(&block[..n]).map_err(err)?;
+            size += n as u64;
+            count -= n as u64;
+        }
+        if tabs {
+            let rest = columns % width;
+            writer.write_all(&[b' '; 8][..rest as usize]).map_err(err)?;
+            size += rest;
+        }
+        writer.flush().map_err(err)?;
+        drop(writer);
+        output.sync_all().map_err(err)?;
+        self.check_source()?;
+        self.remember_edit(0);
+        self.pieces = vec![Piece {
+            source: Source::disk(output)?,
+            start: 0,
+            len: size,
+        }];
+        self.size = size;
+        self.recovered = true;
+        self.finish_edit();
+        self.page(0)
+    }
+    pub fn replace_all(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        revision: u64,
+        progress: impl Fn(u64, u64),
+    ) -> Result<(Page, u64), String> {
+        if revision != self.revision {
+            return Err("The document changed before replacement could start.".into());
+        }
+        if query.is_empty() || query.len() > 4096 {
+            return Err("Enter between 1 and 4096 bytes to replace.".into());
+        }
+        self.check_source()?;
+        let mut output = tempfile::tempfile().map_err(err)?;
+        let mut writer = io::BufWriter::with_capacity(IO_SIZE as usize, &mut output);
+        let finder = memchr::memmem::Finder::new(query.as_bytes());
+        let mut cursor = 0;
+        let mut count = 0;
+        let mut size = 0;
+        let mut last_progress = 0;
+        while cursor < self.size {
+            let bytes = self.read_range(
+                cursor,
+                (self.size - cursor).min(IO_SIZE + query.len() as u64),
+            )?;
+            let covered = IO_SIZE.min(self.size - cursor) as usize;
+            let mut local = 0;
+            while let Some(found) = finder.find(&bytes[local..]) {
+                let position = local + found;
+                if position >= covered {
+                    break;
+                }
+                writer.write_all(&bytes[local..position]).map_err(err)?;
+                writer.write_all(replacement.as_bytes()).map_err(err)?;
+                size += (position - local + replacement.len()) as u64;
+                count += 1;
+                local = position + query.len();
+            }
+            let consumed = covered.max(local);
+            if local < consumed {
+                writer.write_all(&bytes[local..consumed]).map_err(err)?;
+                size += (consumed - local) as u64;
+            }
+            cursor += consumed as u64;
+            if cursor - last_progress >= 16 * IO_SIZE || cursor == self.size {
+                progress(cursor, self.size);
+                last_progress = cursor;
+            }
+        }
+        writer.flush().map_err(err)?;
+        drop(writer);
+        output.sync_all().map_err(err)?;
+        self.check_source()?;
+        if count > 0 {
+            self.remember_edit(0);
+            self.pieces = vec![Piece {
+                source: Source::disk(output)?,
+                start: 0,
+                len: size,
+            }];
+            self.size = size;
+            self.recovered = true;
+            self.finish_edit();
+        }
+        Ok((self.page(0)?, count))
     }
     // Count and locate adjacent matches without retaining an unbounded result list.
     pub fn scan_search(&self, query: &str, start: u64, anchor: u64) -> Result<SearchScan, String> {
@@ -587,7 +1061,7 @@ impl Document {
                 result.count += 1;
                 local = position + query.len();
             }
-            cursor += covered;
+            cursor += covered.max(local as u64);
         }
         self.check_source()?;
         Ok(result)
@@ -627,7 +1101,7 @@ impl Document {
                     });
                 }
             }
-            cursor += covered;
+            cursor += covered.max(local as u64);
         }
         self.check_source()?;
         Ok(SearchResult {

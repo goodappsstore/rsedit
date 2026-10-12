@@ -21,9 +21,12 @@ export interface SearchScan {
   scannedThrough: number; complete: boolean; revision: number;
 }
 
+export interface ExternalChange { changed: boolean; token: string }
+export interface QuickOpen { entries: FolderEntry[]; truncated: boolean; skippedDirectories: number }
+export interface ReplaceResult { page: Page; count: number }
 export interface TabView {
   id: number; name: string; pageStart: number; anchor: number; head: number;
-  scrollTop: number; scrollLeft: number; languageOverride: string | null;
+  scrollTop: number; scrollLeft: number; languageOverride: string | null; indent?: string | null; tabSize?: number | null;
 }
 export interface RestoredTab { info: Info; view: TabView }
 export interface RestoredSession { open: RestoredTab[]; closed: RestoredTab[]; activeIndex: number; folder: FolderView | null; errors: string[] }

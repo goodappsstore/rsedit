@@ -11,6 +11,12 @@ open-source desktop apps.
 [Source](https://github.com/goodappsstore/rsedit) ·
 [Issues](https://github.com/goodappsstore/rsedit/issues)
 
+## Screenshots
+
+### rsedit homescreen
+
+![rsedit homescreen](screenshots/homepage.jpg)
+
 ## Install
 
 Download an installer from [GitHub Releases](https://github.com/goodappsstore/rsedit/releases)
@@ -34,20 +40,37 @@ all platforms listed above.
 ## Features
 
 - Intentionally limited set of features focusing on being a text editor, not IDE.
-- Probably the fastest desktop text/code editor with in-built syntax highlighting. 
-- Open multi-gb files in under a second or two.
+- Fast text/code editing with lazy syntax highlighting.
+- Bounded multi-GB opening; a 3 GiB release UI probe opened within two seconds
+  on the measured Mac (see the performance limits below).
 - Tabs, recent files, drag-and-drop opening, and a resizable folder panel.
 - Multiple cursors, rectangular selection, indentation, and comment shortcuts.
 - Find/replace with regex, case and whole-word options, and match counts.
 - Syntax highlighting for Rust, JavaScript, TypeScript, Python, JSON, Markdown,
   SQL, shell, and more. Language parsers load on demand.
-- Command palette, quick file switching, light/dark themes, word wrap, and
-  adjustable font size.
-- Session restore for open tabs and unsaved buffers, plus up to 50 closed tabs.
+- Command palette, fuzzy quick-open within the selected folder, light/dark
+  themes, word wrap, and adjustable font size.
+- Per-file indentation detection, literal tabs or 2/4/8 spaces, and explicit
+  whole-file indentation conversion.
+- Focus-time checks for external file changes, with clean-buffer reload and
+  recovery choices for edited buffers.
+- Periodic crash recovery and session restore for open tabs and unsaved buffers,
+  plus up to 50 closed tabs.
 
 Open files through the dialog, drag them into the window, or pass paths to the
 executable. macOS Open With is supported. Use **File → Open Folder…** to browse
-a folder; entries load on expansion and refresh manually.
+a folder; entries load on expansion and refresh manually. **Mod+P** fuzzy-matches
+open tabs and relative paths beneath that folder. Folder search runs only when
+requested, with no persistent index. Each request returns at most 80 results
+and stops after 50,000 entries or one second; the palette reports partial results
+and unreadable directories. It skips `.git`, `node_modules`, `target`, and directory
+symlinks. Without a selected folder, quick-open searches open tabs.
+
+Click the indentation indicator to choose spaces or literal tabs for the current
+file, or to convert its leading indentation. Detection samples the first 64 KiB;
+ambiguous or mixed indentation may need an explicit choice. Changing the setting
+affects future input; conversion is a separate undoable command and preserves
+alignment using the selected tab width. The setting is retained in the session.
 
 ## Keyboard shortcuts
 
@@ -61,10 +84,15 @@ a folder; entries load on expansion and refresh manually.
 | Close / Reopen tab | Mod+W / Mod+Shift+T |
 | Find | Mod+F |
 | Command palette | Mod+Shift+P |
-| Switch file | Mod+P |
+| Quick-open folder files / open tabs | Mod+P |
 | Next / Previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Undo / Redo | Mod+Z / Mod+Shift+Z |
 | Select next occurrence | Mod+D |
+| Select all occurrences (visible view for huge files) | Mod+Shift+L |
+| Duplicate line up / down | Alt+Shift+Up / Alt+Shift+Down |
+| Move line up / down | Alt+Up / Alt+Down |
+| Delete line | Mod+Shift+K |
+| Find/replace in visible view only (huge files) | Mod+H |
 | Add cursor above / below | Mod+Alt+Up / Mod+Alt+Down |
 | Go to line | Mod+G |
 | Toggle comment | Mod+/ |
@@ -73,37 +101,65 @@ a folder; entries load on expansion and refresh manually.
 
 ## Large files and performance
 
-The goal is to open the first editable section of a multi-GB text file within
-a second or two. Rust reads only a sample and the first section on opening, 
-keeping unchanged content on disk. File reads, search, and saves run on workers.
+Opening a multi-GB file reads only a sample and its first **256 KiB** view.
+Unchanged content remains on disk, and reads, search, saves, and recovery copies
+run on workers. Opening does not scan the whole file or create a recovery copy.
 
-Files larger than **4 MiB**, or containing a physical line longer than **32 KiB**,
-use large-file mode. The editor loads at most **256 KiB** of original text at a
-time. Use the section toolbar to move forward/backward or jump to a byte offset.
+Files up to **64 MiB** normally use the full editor: continuous scrolling,
+whole-document regex find/replace, selections, and CodeMirror undo. A physical
+line longer than **1 MiB** also selects bounded views. Files above 4 MiB start with
+plain text to avoid automatic parser work; a language can still be selected
+explicitly.
 
-- Line numbers, go to line, selections, undo, and find/replace apply to the
-  **current section**. Changing sections starts fresh section undo history.
-- The first `Mod+F` opens case-sensitive literal **whole-file search**. Press it
-  again for section find/replace. Whole-file regex and replace are unavailable.
-- Extremely long lines use plain text. Sections may lack preceding multiline
-  syntax context; folding and bracket assistance are omitted in large-file mode.
-- Unedited sections are preserved byte-for-byte, including UTF-8 and CRLF
-  boundaries. Memory grows with edits, loaded sections, and undo history.
-- Saving streams the complete result and requires temporary disk space for it.
-  Continuous scrolling through an entire large file is not supported.
+For huge files, bounded views are for navigation; edits belong to one disk-backed
+document. Saving always streams the **entire resulting file**, with unchanged
+bytes retained exactly. The toolbar moves between views or jumps to a byte offset.
 
-Measurements on M1 Air 8GB:
+- **Mod+F** always opens case-sensitive literal **whole-file find/replace**.
+  Replace all streams into a temporary disk buffer, shows progress, and commits
+  only after the operation succeeds and source guards pass. Your user file changes
+  only when you Save. Replacement and indentation conversion are undoable.
+- **Undo/redo span views and saves**. Pending view edits become a history group
+  when flushed for navigation, recovery, save, whole-file operations, or undo.
+  Ordinary files retain CodeMirror's typing history. Restart starts fresh history.
+- Line numbers, go to line, selections, and multiple cursors remain relative to
+  the **visible view**. **Mod+H** explicitly opens view-only regex find/replace;
+  its scope is displayed, including the scope of Replace all. Whole-file regex
+  replacement and continuous scrolling across huge-file views are not supported.
+- Extremely long lines use plain text. Views may lack preceding multiline syntax
+  context; folding and bracket assistance are omitted in bounded mode.
+- Unchanged text survives local edits byte-for-byte, including BOM, UTF-8, CRLF,
+  and mixed separators outside changed ranges. Memory grows with edits, loaded
+  views, and undo history. Whole-file operations require temporary disk space.
+- Long operations display status/progress and lock the affected document while
+  allowing tab switching. A background recovery copy captures immutable pieces
+  with a brief document lock; its disk streaming does not lock out typing.
+
+Release measurements on an M1 Air with 8 GiB RAM, macOS arm64, using disposable
+3 GiB text fixtures on the local filesystem:
 
 | Measurement | Result |
 | --- | --- |
-| Warm native editor readiness, from Rust entry | 416–624 ms |
-| Open and first-section read, 1 GiB Rust-core fixture | 0.22 ms |
-| Peak memory, Rust-core fixture process | About 6 MiB |
+| First 3 GiB native view readiness, from Rust entry | 1.34 s |
+| 3 GiB native open request to view readiness | 132 ms |
+| 3 GiB Rust-core open and first-view read | 0.46–1.23 ms |
+| Peak RSS, separate Rust-core open-only process | 2.3 MiB |
+| Sampled native app RSS at initial view | About 98 MiB |
+| Sampled newly spawned WebKit processes, combined RSS | About 95 MiB |
+| First full recovery source copy for an edited 3 GiB file | 3.52–5.53 s |
+| Subsequent checkpoint after another one-byte edit | 9.4–13.2 ms |
+| Unchanged / edited checkpoint after recovery restart | 5.3–9.9 / 9.1–9.5 ms |
+| Recovered 3 GiB Save As | 4.50–4.75 s |
 
-Readiness includes webview initialization, excludes process-loader time, and
-is not first paint. The warm-filesystem core probe excludes native UI memory
-and rendering. Neither measures cold-storage or multi-GB UI opening times.
-Set `RSEDIT_PROFILE_STARTUP=1` on a release executable to measure readiness.
+Native readiness includes webview initialization and two animation-frame callbacks
+after installing the first view; it excludes process-loader time and is not a
+first-paint instrument. Native RSS is a point-in-time sample, not a peak, and the
+WebKit total covers newly spawned content/GPU/networking processes. Core timings
+exclude the native UI. Fixtures were freshly written or warm; cold storage,
+remote filesystems, and Windows/Linux UI performance are not established. The
+under-two-second target is demonstrated on this setup, not a guarantee for every
+machine or storage device. Set `RSEDIT_PROFILE_STARTUP=1` on a release executable
+to log editor and newly opened view readiness.
 
 ## Sessions and file safety
 
@@ -116,23 +172,40 @@ write edits to disk. Recovery data lives in the app data directory's `session/`
 folder; on macOS this is normally
 `~/Library/Application Support/com.goodapps.rsedit/session/`.
 
-Recovery happens on **orderly quit**. Force quit and crashes lose changes since
-the last checkpoint. Modified large files require full recovery copies and can
-make quitting slower. The window stays open if saving the session fails.
+Recovery is checkpointed **every 30 seconds** after startup, as well as on orderly
+quit. A busy file can defer a periodic checkpoint; the next interval retries.
+The status bar shows checkpoint progress, success, failure, and newer edits still
+awaiting recovery. Crashes and force
+quit restore the last completed checkpoint; newer edits can still be lost.
+
+For edited huge files, the first checkpoint streams an immutable copy of each
+source into the session directory. Later checkpoints reuse those copies and
+store changed bytes plus piece references, including after recovery restart.
+Unchanged buffers reuse their last snapshot. The manifest is replaced only after
+all new recovery data is synced; an interrupted checkpoint leaves the previous
+manifest usable. A corrupt/unreadable manifest and failed recovery buffers are
+preserved. The window stays open if its final checkpoint fails. Recovery copies
+can take seconds and require disk space, especially after a whole-file operation.
 
 rsedit supports UTF-8 text, including a BOM and LF/CRLF. Binary and UTF-16 files
-are rejected; large files are validated section by section. Edited sections
-normalize mixed line endings to the detected separator.
+are rejected; huge files are validated view by view. New editor line breaks use
+the detected separator; unchanged source bytes keep their original separators.
 
 Saves guard against external changes using size and modification time, preserve
 basic permissions, and replace the destination through a synced temporary file.
-These checks can miss changes that preserve metadata. There is no live watcher
-or power-loss recovery guarantee. Symlinks resolve to their target; hard links,
-extended metadata, and ACLs may not survive replacement.
+Retained disk handles also carry their own metadata guards, so undo cannot
+silently read changed old source bytes after Save As. These checks can miss changes
+that preserve metadata. On regaining focus, rsedit checks open files, reloads clean buffers, and offers edited buffers choices
+to keep edits, Save As, copy the visible text to a new recovery tab, or reload
+with a discard prompt. Repeated notices for the same disk version are suppressed.
+There is no live watcher or power-loss recovery guarantee. Symlinks resolve to
+their target; hard links, extended metadata, and ACLs may not survive replacement.
 
-If a large-file source changes externally, copy pending section edits before
-using **Reload file from disk**. For fully loaded edited files, **Save As** can
-rescue your work to a different path.
+If an original disk-backed huge-file source changes externally, rsedit cannot
+safely reconstruct unseen old bytes. Use **Copy visible text to a new recovery
+tab** before reloading, and retain the last successful checkpoint. Fully loaded,
+restored, or completely transformed buffers can be rescued with **Save As** to
+another path. rsedit never silently overwrites an external change.
 
 ## Build from source
 
@@ -181,6 +254,19 @@ node .github/scripts/check-release.mjs
 
 The frontend is strict TypeScript with vanilla DOM and CodeMirror in `src/`.
 Rust file handling, sessions, and native commands live in `src-tauri/src/`.
+
+Verification for these changes used disposable Rust fixtures for byte preservation,
+BOM/UTF-8/CRLF boundaries, permission preservation, external-save guards, stale
+revisions, cross-view/cross-save undo, streamed replacement and indentation,
+3 GiB recovery copies, restart snapshot reuse, unreadable manifests, and folder
+quick-open. Disposable DOM probes covered per-file indentation, conversion/undo,
+fuzzy tab filtering, and palette discoverability. Mocked desktop IPC probes
+covered typing during recovery streaming, checkpoint/close/reopen ordering,
+focus-time clean reload and edited-buffer recovery choices, and quit preserving
+open/closed buffers without unsaved prompts. The macOS release app was
+launched with an isolated application identifier and a disposable 3 GiB file;
+opening/readiness and memory were measured without screenshots. Native dialogs,
+focus interactions, and Windows/Linux runtime behavior remain unverified.
 
 ## Releases
 

@@ -88,8 +88,14 @@ async fn read_directory(path: String) -> Result<folder::FolderListing, String> {
         .map_err(|e| e.to_string())?
 }
 #[tauri::command]
+async fn quick_open(path: String, query: String) -> Result<folder::QuickOpen, String> {
+    tauri::async_runtime::spawn_blocking(move || folder::quick_open(PathBuf::from(path), &query))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
 async fn read_page(editor: State<'_, Editor>, id: u64, offset: u64) -> Result<Page, String> {
-    work(editor.get(id)?, move |doc| doc.page(offset)).await
+    work(editor.get(id)?, move |doc| doc.load_page(offset)).await
 }
 #[tauri::command]
 async fn replace_range(
@@ -99,9 +105,88 @@ async fn replace_range(
     end: u64,
     text: String,
     revision: u64,
+    mark_clean: Option<bool>,
 ) -> Result<Info, String> {
     work(editor.get(id)?, move |doc| {
-        doc.replace(start, end, text, revision)
+        doc.replace(start, end, text, revision)?;
+        if mark_clean == Some(true) {
+            doc.mark_clean();
+        }
+        Ok(doc.info())
+    })
+    .await
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExternalChange {
+    changed: bool,
+    token: String,
+}
+#[tauri::command]
+async fn check_external_change(
+    editor: State<'_, Editor>,
+    id: u64,
+) -> Result<ExternalChange, String> {
+    work(editor.get(id)?, |doc| {
+        let (changed, token) = doc.external_change();
+        Ok(ExternalChange { changed, token })
+    })
+    .await
+}
+#[tauri::command]
+async fn document_history(
+    editor: State<'_, Editor>,
+    id: u64,
+    redo: bool,
+    offset: u64,
+    revision: u64,
+) -> Result<Page, String> {
+    work(editor.get(id)?, move |doc| {
+        doc.history(redo, offset, revision)
+    })
+    .await
+}
+#[derive(serde::Serialize)]
+struct ReplaceResult {
+    page: Page,
+    count: u64,
+}
+#[derive(Clone, serde::Serialize)]
+struct OperationProgress {
+    id: u64,
+    done: u64,
+    total: u64,
+}
+#[tauri::command]
+async fn replace_entire_file(
+    app: tauri::AppHandle,
+    editor: State<'_, Editor>,
+    id: u64,
+    query: String,
+    replacement: String,
+    revision: u64,
+) -> Result<ReplaceResult, String> {
+    work(editor.get(id)?, move |doc| {
+        let (page, count) = doc.replace_all(&query, &replacement, revision, |done, total| {
+            let _ = app.emit("document-progress", OperationProgress { id, done, total });
+        })?;
+        Ok(ReplaceResult { page, count })
+    })
+    .await
+}
+#[tauri::command]
+async fn convert_document_indent(
+    app: tauri::AppHandle,
+    editor: State<'_, Editor>,
+    id: u64,
+    tabs: bool,
+    width: u8,
+    revision: u64,
+) -> Result<Page, String> {
+    work(editor.get(id)?, move |doc| {
+        doc.convert_indent(tabs, width, revision, |done, total| {
+            let _ = app.emit("document-progress", OperationProgress { id, done, total });
+        })
     })
     .await
 }
@@ -168,6 +253,15 @@ async fn persist_session(app: tauri::AppHandle, view: SessionView) -> Result<(),
     })
     .await
     .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn file_view_ready(id: u64, elapsed_ms: f64, clock: State<'_, StartupClock>) {
+    if std::env::var_os("RSEDIT_PROFILE_STARTUP").is_some() {
+        eprintln!(
+            "rsedit: document {id} view ready in {elapsed_ms:.1} ms; {:.1} ms from Rust entry",
+            clock.0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 #[tauri::command]
 async fn startup_paths(
@@ -270,10 +364,16 @@ pub fn run() {
             read_page,
             replace_range,
             save_document,
+            check_external_change,
+            document_history,
+            replace_entire_file,
+            convert_document_indent,
+            quick_open,
             search_document,
             scan_search,
             close_document,
             startup_paths,
+            file_view_ready,
             restore_session,
             persist_session
         ])

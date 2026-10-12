@@ -67,6 +67,9 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
   return EditorState.create({
     doc: page.text,
     extensions: [
+      // Tauri gives the boot style a nonce in packaged builds. Reuse it for
+      // CodeMirror's generated styles; CSP ignores unsafe-inline with a nonce.
+      EditorView.cspNonce.of(document.querySelector<HTMLStyleElement>('style[nonce]')?.nonce ?? ''),
       theme, matchField, lineNumbers(), highlightSpecialChars(), history({ minDepth: 100 }),
       drawSelection(), dropCursor(), rectangularSelection(),
       highlightActiveLine(), highlightActiveLineGutter(),

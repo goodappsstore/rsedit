@@ -94,6 +94,47 @@ async fn quick_open(path: String, query: String) -> Result<folder::QuickOpen, St
         .map_err(|e| e.to_string())?
 }
 #[tauri::command]
+async fn create_file(parent: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || folder::create_file(parent, name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn create_folder(parent: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || folder::create_folder(parent, name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn rename_path(from: String, name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || folder::rename_path(from, name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn delete_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || folder::delete_path(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || folder::reveal_in_file_manager(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+async fn retarget_document(
+    editor: State<'_, Editor>,
+    id: u64,
+    path: String,
+) -> Result<Info, String> {
+    work(editor.get(id)?, move |doc| {
+        doc.retarget(PathBuf::from(path))
+    })
+    .await
+}
+#[tauri::command]
 async fn read_page(editor: State<'_, Editor>, id: u64, offset: u64) -> Result<Page, String> {
     work(editor.get(id)?, move |doc| doc.load_page(offset)).await
 }
@@ -329,6 +370,11 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .text("wrap", "Toggle Word Wrap")
         .text("theme", "Toggle Theme")
         .text("toggle-folder", "Toggle Folder Panel")
+        .separator()
+        .text("split", "Split Editor Right")
+        .text("focus-other", "Focus Other Pane")
+        .text("move-to-other", "Move Current Tab to Other Pane")
+        .text("close-split", "Close Split")
         .build()?;
     let app_menu = SubmenuBuilder::new(app, "rsedit").about(None).separator();
     #[cfg(target_os = "macos")]
@@ -369,6 +415,12 @@ pub fn run() {
             replace_entire_file,
             convert_document_indent,
             quick_open,
+            create_file,
+            create_folder,
+            rename_path,
+            delete_path,
+            reveal_in_file_manager,
+            retarget_document,
             search_document,
             scan_search,
             close_document,

@@ -396,6 +396,17 @@ impl Document {
         self.check_source()?;
         Ok((self.revision, self.dirty))
     }
+    /// Point an open document at a renamed path. Content, history, and revision
+    /// are untouched; only the save target and external-change guard move.
+    pub fn retarget(&mut self, path: PathBuf) -> Result<Info, String> {
+        let path = fs::canonicalize(&path).map_err(err)?;
+        if !path.is_file() {
+            return Err("The renamed file is no longer available.".into());
+        }
+        self.stamp = Some(Stamp::read(&path)?);
+        self.path = Some(path);
+        Ok(self.info())
+    }
     fn edit_state(&self, offset: u64) -> EditState {
         EditState {
             pieces: self.pieces.clone(),

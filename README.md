@@ -44,6 +44,7 @@ all platforms listed above.
 - Bounded multi-GB opening; a 3 GiB release UI probe opened within two seconds
   on the measured Mac (see the performance limits below).
 - Tabs, recent files, drag-and-drop opening, and a resizable folder panel.
+- Split editor panes side by side, with a draggable divider and session restore.
 - Multiple cursors, rectangular selection, indentation, and comment shortcuts.
 - Find/replace with regex, case and whole-word options, and match counts.
 - Syntax highlighting for Rust, JavaScript, TypeScript, Python, JSON, Markdown,
@@ -66,6 +67,18 @@ and stops after 50,000 entries or one second; the palette reports partial result
 and unreadable directories. It skips `.git`, `node_modules`, `target`, and directory
 symlinks. Without a selected folder, quick-open searches open tabs.
 
+Right-click (or `Shift+F10` on a focused row) a folder entry to create files
+and folders, rename, permanently delete with confirmation, copy the path, or
+reveal it in the system file manager. Open buffers track renames; deleting a
+file closes its clean tabs but keeps edited buffers, which offer Save As to
+survive.
+
+**Mod+\\** (or View → Split Editor Right) shows a second file beside the
+current one. Click either side to focus it; the toolbar, search panels, page
+navigation, and status bar follow focus. The tab strip is shared: clicking a
+tab shows it in the focused pane, and closing a pane never closes its file.
+The split restores with the session; the divider width is remembered.
+
 Click the indentation indicator to choose spaces or literal tabs for the current
 file, or to convert its leading indentation. Detection samples the first 64 KiB;
 ambiguous or mixed indentation may need an explicit choice. Changing the setting
@@ -85,6 +98,7 @@ alignment using the selected tab width. The setting is retained in the session.
 | Find | Mod+F |
 | Command palette | Mod+Shift+P |
 | Quick-open folder files / open tabs | Mod+P |
+| Split editor right / close split | Mod+\ |
 | Next / Previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
 | Undo / Redo | Mod+Z / Mod+Shift+Z |
 | Select next occurrence | Mod+D |

@@ -29,7 +29,7 @@ export interface TabView {
   scrollTop: number; scrollLeft: number; languageOverride: string | null; indent?: string | null; tabSize?: number | null;
 }
 export interface RestoredTab { info: Info; view: TabView }
-export interface RestoredSession { open: RestoredTab[]; closed: RestoredTab[]; activeIndex: number; folder: FolderView | null; errors: string[] }
+export interface RestoredSession { open: RestoredTab[]; closed: RestoredTab[]; activeIndex: number; secondaryIndex: number | null; folder: FolderView | null; errors: string[] }
 
 export const desktop = isTauri();
 // A scratch buffer in browser preview; file access always belongs to Rust.

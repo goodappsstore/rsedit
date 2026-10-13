@@ -35,6 +35,8 @@ pub struct SessionView {
     pub closed: Vec<TabView>,
     pub active: Option<u64>,
     #[serde(default)]
+    pub secondary: Option<u64>,
+    #[serde(default)]
     pub folder: Option<FolderView>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -53,6 +55,7 @@ pub struct RestoredSession {
     pub open: Vec<RestoredTab>,
     pub closed: Vec<RestoredTab>,
     pub active_index: usize,
+    pub secondary_index: Option<usize>,
     pub folder: Option<FolderView>,
     pub errors: Vec<String>,
 }
@@ -68,6 +71,8 @@ struct SavedSession {
     open: Vec<SavedTab>,
     closed: Vec<SavedTab>,
     active_index: usize,
+    #[serde(default)]
+    secondary_index: Option<usize>,
     #[serde(default)]
     folder: Option<FolderView>,
 }
@@ -125,6 +130,7 @@ impl SessionStore {
                 open: vec![],
                 closed: vec![],
                 active_index: 0,
+                secondary_index: None,
                 folder: None,
             },
             Err(e) => return Err(err(e)),
@@ -160,6 +166,9 @@ impl SessionStore {
                         } else {
                             if index == saved.active_index {
                                 restored.active_index = restored.open.len();
+                            }
+                            if Some(index) == saved.secondary_index {
+                                restored.secondary_index = Some(restored.open.len());
                             }
                             restored.open.push(RestoredTab {
                                 info,
@@ -219,11 +228,16 @@ impl SessionStore {
             .iter()
             .position(|tab| Some(tab.id) == view.active)
             .unwrap_or(0);
+        let secondary_index = view
+            .open
+            .iter()
+            .position(|tab| Some(tab.id) == view.secondary);
         let mut saved = SavedSession {
             version: 2,
             open: vec![],
             closed: vec![],
             active_index,
+            secondary_index,
             folder: view.folder,
         };
         let mut sources = state.sources.clone();

@@ -1,7 +1,7 @@
 import './style.css';
 import { EditorSelection, EditorState, StateEffect } from '@codemirror/state';
 import type { Text } from '@codemirror/state';
-import { EditorView, keymap } from '@codemirror/view';
+import { EditorView, keymap, placeholder } from '@codemirror/view';
 import type { ViewUpdate } from '@codemirror/view';
 import { Compartment } from '@codemirror/state';
 import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, setSearchQuery, SearchQuery, gotoLine, selectSelectionMatches } from '@codemirror/search';
@@ -70,6 +70,7 @@ app.innerHTML = `
     <button data-action="open-folder" title="Open folder">Folder</button>
     <button data-action="save" title="Save">Save</button>
     <button data-action="find" title="Find and replace">Find</button>
+    <button data-action="split" title="Split editor right">Split</button>
     <div class="spacer"></div>
     <button data-action="palette" class="quiet" title="Command palette">Commands <small>${mod}⇧P</small></button>
     <button data-action="wrap" title="Toggle word wrap" aria-pressed="false">Wrap</button>
@@ -97,7 +98,7 @@ app.innerHTML = `
       <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: restore position. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
       
     </section>
-    <div class="editor-host"></div>
+    <div class="split-row"></div>
   </main>
     </div>
   </div>
@@ -164,32 +165,223 @@ const shortcuts = keymap.of([
   { key: 'Mod-p', run: () => { showFiles(); return true; } },
   { key: 'Mod-g', run: () => { gotoLine(view); return true; } },
   { key: 'Mod-Shift-w', run: () => { toggleWrap(); return true; } },
+  { key: 'Mod-\\', run: () => { if (secondaryPane) closeSplit(); else splitRight(); return true; } },
   { key: 'Ctrl-Tab', run: () => { cycleTab(1); return true; } },
   { key: 'Ctrl-Shift-Tab', run: () => { cycleTab(-1); return true; } },
   { key: 'Mod-=', run: () => { zoom(1); return true; } },
   { key: 'Mod--', run: () => { zoom(-1); return true; } },
-  { key: 'Mod-0', run: () => { preferences.fontSize = 14; storePreferences(); view.requestMeasure(); return true; } },
+  { key: 'Mod-0', run: () => { preferences.fontSize = 14; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); return true; } },
   { key: 'Escape', run: () => { if (!largeSearch.hidden) { void safely(resetLargeSearch); return true; } if (searchPanelOpen(view.state)) { resetSectionSearch(); return true; } return false; } },
 ]);
-const view = new EditorView({ parent: element('.editor-host'), extensions: [EditorState.readOnly.of(true), EditorView.editable.of(false)] });
-const folders = createFolderPanel(element('.folder-panel'), element('.folder-divider'), path => safely(() => openPath(path)),
-  error => notify(String(error instanceof Error ? error.message : error), true), () => view.requestMeasure());
-function changed(update: ViewUpdate): void {
-  if (!active) return;
-  active.state = update.state;
-  updateSectionCount(update);
-  if (update.docChanged) {
-    for (const origin of [largeOrigin, sectionOrigin]) if (origin?.tab === active && origin.pageStart === active.pageStart) {
-      origin.selection = origin.selection.map(update.changes);
-      origin.byteOffset = active.pageStart + new TextEncoder().encode(update.state.sliceDoc(0, origin.selection.main.head)).length;
+interface Pane {
+  element: HTMLElement;
+  host: HTMLElement;
+  view: EditorView;
+  tab?: Tab;
+}
+const panes: Pane[] = [];
+let focusedPane!: Pane;
+let view!: EditorView;
+const primaryPane = makePane();
+element('.split-row').append(primaryPane.element);
+focusedPane = primaryPane;
+view = primaryPane.view;
+let secondaryPane: Pane | undefined;
+let splitDivider: HTMLElement | undefined;
+let splitRatio = 0.5;
+try {
+  const stored = Number(localStorage.getItem('rsedit.splitRatio'));
+  if (Number.isFinite(stored) && stored > 0.15 && stored < 0.85) splitRatio = stored;
+} catch { /* Optional preference. */ }
+function makePane(): Pane {
+  const element = document.createElement('div');
+  element.className = 'split-pane';
+  const host = document.createElement('div');
+  host.className = 'editor-host';
+  element.append(host);
+  const pane: Pane = {
+    element, host,
+    view: new EditorView({
+      parent: host,
+      state: EditorState.create({
+        doc: '',
+        extensions: [
+          EditorState.readOnly.of(true), EditorView.editable.of(false),
+          placeholder('Open a file or click a tab to show it here.'),
+        ],
+      }),
+    }),
+  };
+  pane.view.dom.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
+  host.addEventListener('input', commitSectionQuery);
+  host.addEventListener('compositionend', commitSectionQuery);
+  panes.push(pane);
+  return pane;
+}
+function paneOfTab(tab: Tab): Pane | undefined {
+  return panes.find(pane => pane.tab === tab);
+}
+function showInPane(tab: Tab, pane: Pane): void {
+  pane.tab = tab;
+  pane.view.setState(tab.state);
+  pane.view.scrollDOM.scrollTop = tab.scrollTop;
+  pane.view.scrollDOM.scrollLeft = tab.scrollLeft;
+  updateSectionCount(undefined, pane);
+}
+function focusPane(pane: Pane, focusEditor = true): void {
+  if (!panes.includes(pane)) return;
+  focusedPane = pane;
+  view = pane.view;
+  active = pane.tab;
+  pane.view.requestMeasure();
+  renderTabs(); renderStatus();
+  if (pane.tab && !pane.tab.loaded) void safely(() => ensureLoaded(pane.tab!));
+  if (focusEditor && pane.tab) pane.view.focus();
+}
+function applySplitRatio(): void {
+  if (!secondaryPane || !splitDivider) return;
+  primaryPane.element.style.flexGrow = String(splitRatio);
+  secondaryPane.element.style.flexGrow = String(1 - splitRatio);
+  for (const pane of panes) pane.view.requestMeasure();
+}
+function storeSplitRatio(): void {
+  try { localStorage.setItem('rsedit.splitRatio', String(splitRatio)); } catch { /* Optional preference. */ }
+}
+function makeSplitPane(): Pane {
+  const row = element('.split-row');
+  splitDivider = document.createElement('div');
+  splitDivider.className = 'split-divider';
+  splitDivider.setAttribute('role', 'separator');
+  splitDivider.setAttribute('aria-label', 'Split pane width');
+  splitDivider.setAttribute('aria-orientation', 'vertical');
+  splitDivider.tabIndex = 0;
+  const pane = makePane();
+  secondaryPane = pane;
+  row.append(splitDivider, pane.element);
+  applySplitRatio();
+  let drag: { x: number; ratio: number; pointerId: number } | undefined;
+  splitDivider.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    drag = { x: event.clientX, ratio: splitRatio, pointerId: event.pointerId };
+    splitDivider!.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing-split');
+  });
+  splitDivider.addEventListener('pointermove', event => {
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const rect = row.getBoundingClientRect();
+    if (rect.width > 0) {
+      splitRatio = Math.min(0.85, Math.max(0.15, drag.ratio + (event.clientX - drag.x) / rect.width));
+      applySplitRatio();
     }
-    active.pending = !update.state.doc.eq(active.syncedDoc);
+  });
+  const endDrag = (): void => {
+    if (!drag) return;
+    drag = undefined;
+    document.body.classList.remove('resizing-split');
+    storeSplitRatio();
+  };
+  splitDivider.addEventListener('pointerup', endDrag);
+  splitDivider.addEventListener('pointercancel', endDrag);
+  splitDivider.addEventListener('lostpointercapture', endDrag);
+  splitDivider.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    splitRatio = Math.min(0.85, Math.max(0.15, splitRatio + (event.key === 'ArrowLeft' ? -0.05 : 0.05)));
+    applySplitRatio();
+    storeSplitRatio();
+  });
+  return pane;
+}
+function closeSplitPane(pane: Pane): void {
+  const index = panes.indexOf(pane);
+  if (index === -1 || pane === primaryPane) return;
+  if (pane.tab) {
+    pane.tab.scrollTop = pane.view.scrollDOM.scrollTop;
+    pane.tab.scrollLeft = pane.view.scrollDOM.scrollLeft;
+  }
+  pane.view.destroy();
+  pane.element.remove();
+  splitDivider?.remove();
+  splitDivider = undefined;
+  panes.splice(index, 1);
+  if (pane === secondaryPane) secondaryPane = undefined;
+  if (focusedPane === pane) focusPane(primaryPane, false);
+  else {
+    renderTabs();
+    focusedPane.view.requestMeasure();
+  }
+}
+function splitRight(): void {
+  if (secondaryPane) { focusPane(secondaryPane); return; }
+  const pane = makeSplitPane();
+  const other = [...selectionHistory].reverse().find(candidate => candidate !== active)
+    ?? tabs.find(candidate => candidate !== active);
+  if (other) {
+    showInPane(other, pane);
+    void safely(() => ensureLoaded(other));
+  }
+  focusPane(pane);
+  notify(other ? `Split opened with ${other.info.name}. Click either side to focus it.` : 'Split opened. Click a tab or open a file to show it here.');
+}
+function closeSplit(): void {
+  if (!secondaryPane) { notify('No split is open.'); return; }
+  closeSplitPane(secondaryPane);
+}
+function focusOtherPane(): void {
+  if (!secondaryPane) { notify('No split is open.'); return; }
+  focusPane(focusedPane === primaryPane ? secondaryPane : primaryPane);
+}
+function moveTabToOtherPane(): void {
+  const tab = active;
+  if (!tab) return;
+  const source = focusedPane;
+  let target = panes.find(pane => pane !== source);
+  if (!target) target = makeSplitPane();
+  if (target.tab) {
+    const other = target.tab;
+    showInPane(tab, target);
+    showInPane(other, source);
+    void safely(() => ensureLoaded(other));
+    focusPane(target);
+    return;
+  }
+  source.tab = undefined;
+  showInPane(tab, target);
+  const replacement = [...selectionHistory].reverse().find(candidate => candidate !== tab)
+    ?? tabs.find(candidate => candidate !== tab);
+  if (replacement) {
+    showInPane(replacement, source);
+    void safely(() => ensureLoaded(replacement));
+  } else if (source === primaryPane) void safely(newTab);
+  else closeSplitPane(source);
+  focusPane(target);
+}
+const folders = createFolderPanel(element('.folder-panel'), element('.folder-divider'), path => safely(() => openPath(path)),
+  error => notify(String(error instanceof Error ? error.message : error), true), () => view.requestMeasure(), {
+  notify,
+  confirmDelete,
+  renamed: handleRenamed,
+  deleted: handleDeleted,
+});
+function changed(update: ViewUpdate): void {
+  const pane = panes.find(candidate => candidate.view === update.view);
+  const tab = pane?.tab;
+  if (!pane || !tab) return;
+  tab.state = update.state;
+  updateSectionCount(update, pane);
+  if (update.docChanged) {
+    for (const origin of [largeOrigin, sectionOrigin]) if (origin?.tab === tab && origin.pageStart === tab.pageStart) {
+      origin.selection = origin.selection.map(update.changes);
+      origin.byteOffset = tab.pageStart + new TextEncoder().encode(update.state.sliceDoc(0, origin.selection.main.head)).length;
+    }
+    tab.pending = !update.state.doc.eq(tab.syncedDoc);
     if (sessionReady && !checkpointPromise) element('.recovery').textContent = 'Recovery pending';
-    cancelSearch();
-    element('.match-count').textContent = 'Search changed; press Enter to search again.';
+    if (tab === largeFind?.tab) cancelSearch();
+    if (tab === active) element('.match-count').textContent = 'Search changed; press Enter to search again.';
     renderTabs();
   }
-  if (update.selectionSet || update.docChanged) renderStatus();
+  if ((update.selectionSet || update.docChanged) && tab === active) renderStatus();
 }
 function options(tab?: Pick<Tab, 'indent' | 'tabSize'>) {
   return { wrap: preferences.wrap, indent: tab?.indent ?? ' '.repeat(preferences.indent), tabSize: tab?.tabSize ?? preferences.indent, changed, shortcuts };
@@ -209,7 +401,8 @@ function detectIndent(text: string): { indent: string; tabSize: number } {
 }
 function lockExtension(busy: boolean) { return [EditorState.readOnly.of(busy), EditorView.editable.of(!busy)]; }
 function applyEffect(tab: Tab, effects: StateEffect<unknown> | readonly StateEffect<unknown>[]): void {
-  if (active === tab) view.dispatch({ effects });
+  const shown = paneOfTab(tab);
+  if (shown) shown.view.dispatch({ effects });
   else tab.state = tab.state.update({ effects }).state;
 }
 async function locked<T>(tab: Tab, action: () => Promise<T>): Promise<T> {
@@ -234,7 +427,8 @@ function installPage(tab: Tab, page: Page): void {
   tab.pending = false;
   tab.loaded = true;
   tab.scrollTop = tab.scrollLeft = 0;
-  if (active === tab) { view.setState(tab.state); view.focus(); updateSectionCount(); }
+  const shown = paneOfTab(tab);
+  if (shown) { shown.view.setState(tab.state); updateSectionCount(undefined, shown); if (shown === focusedPane) shown.view.focus(); }
   void loadLanguage(tab);
   renderTabs(); renderStatus();
 }
@@ -276,9 +470,10 @@ function restoredTab(entry: RestoredTab): Tab {
 function captureTabView(tab: Tab): TabView {
   if (!tab.loaded && tab.savedView) return { ...tab.savedView, id: tab.info.id, name: tab.info.name, languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
   const selection = tab.state.selection.main;
+  const shown = paneOfTab(tab);
   return { id: tab.info.id, name: tab.info.name, pageStart: tab.pageStart, anchor: selection.anchor, head: selection.head,
-    scrollTop: active === tab ? view.scrollDOM.scrollTop : tab.scrollTop,
-    scrollLeft: active === tab ? view.scrollDOM.scrollLeft : tab.scrollLeft,
+    scrollTop: shown ? shown.view.scrollDOM.scrollTop : tab.scrollTop,
+    scrollLeft: shown ? shown.view.scrollDOM.scrollLeft : tab.scrollLeft,
     languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
 }
 function applySavedView(tab: Tab, saved: TabView): void {
@@ -286,10 +481,11 @@ function applySavedView(tab: Tab, saved: TabView): void {
   const length = tab.state.doc.length;
   const selection = EditorSelection.range(Math.min(saved.anchor, length), Math.min(saved.head, length));
   tab.scrollTop = saved.scrollTop; tab.scrollLeft = saved.scrollLeft;
-  if (active === tab) {
-    view.dispatch({ selection });
-    view.requestMeasure({ read: () => null, write: () => {
-      if (active === tab) { view.scrollDOM.scrollTop = tab.scrollTop; view.scrollDOM.scrollLeft = tab.scrollLeft; }
+  const shown = paneOfTab(tab);
+  if (shown) {
+    shown.view.dispatch({ selection });
+    shown.view.requestMeasure({ read: () => null, write: () => {
+      if (paneOfTab(tab) === shown) { shown.view.scrollDOM.scrollTop = tab.scrollTop; shown.view.scrollDOM.scrollLeft = tab.scrollLeft; }
     } });
   } else tab.state = tab.state.update({ selection }).state;
   renderTabs(); renderStatus();
@@ -326,24 +522,30 @@ function reopenClosedTab(): Promise<void> {
 }
 async function newTab(): Promise<void> { await addPage(await call<Page>('new_document')); }
 function activate(tab: Tab): void {
-  if (active === tab) { view.focus(); if (!tab.loaded) void safely(() => ensureLoaded(tab)); return; }
-  if (active) {
-    active.state = view.state;
-    active.scrollTop = view.scrollDOM.scrollTop;
-    active.scrollLeft = view.scrollDOM.scrollLeft;
+  const shown = paneOfTab(tab);
+  if (shown) {
+    if (shown !== focusedPane) focusPane(shown);
+    else {
+      view.focus();
+      renderTabs(); renderStatus();
+    }
+    if (!tab.loaded) void safely(() => ensureLoaded(tab));
+    return;
   }
   hideLargeSearch();
   sectionOrigin = undefined;
+  const pane = focusedPane;
+  if (pane.tab) {
+    pane.tab.scrollTop = pane.view.scrollDOM.scrollTop;
+    pane.tab.scrollLeft = pane.view.scrollDOM.scrollLeft;
+  }
   active = tab;
   const historyIndex = selectionHistory.indexOf(tab);
   if (historyIndex !== -1) selectionHistory.splice(historyIndex, 1);
   selectionHistory.push(tab);
-  view.setState(tab.state);
-  updateSectionCount();
-  view.scrollDOM.scrollTop = tab.scrollTop;
-  view.scrollDOM.scrollLeft = tab.scrollLeft;
-  view.requestMeasure();
-  view.focus();
+  showInPane(tab, pane);
+  pane.view.requestMeasure();
+  pane.view.focus();
   renderTabs(); renderStatus();
   if (!tab.loaded) void safely(() => ensureLoaded(tab));
 }
@@ -382,7 +584,8 @@ function renderTabs(): void {
   folders.select(active?.info.path ?? null);
   tabbar.replaceChildren(...tabs.map(tab => {
     const node = document.createElement('button');
-    node.className = `tab${tab === active ? ' active' : ''}`;
+    const shown = paneOfTab(tab);
+    node.className = `tab${tab === active ? ' active' : ''}${shown && tab !== active ? ' secondary' : ''}`;
     node.setAttribute('role', 'tab');
     node.setAttribute('aria-selected', String(tab === active));
     node.tabIndex = tab === active ? 0 : -1;
@@ -531,26 +734,74 @@ function closeTab(tab: Tab | undefined): Promise<void> {
         await call('close_document', { id: closedTabs[0].info.id });
         closedTabs.shift();
       }
-      if (active === tab) {
-        hideLargeSearch();
-        tab.state = view.state;
-        tab.scrollTop = view.scrollDOM.scrollTop;
-        tab.scrollLeft = view.scrollDOM.scrollLeft;
+      const shown = paneOfTab(tab);
+      if (shown) {
+        shown.tab = undefined;
+        tab.state = shown.view.state;
+        tab.scrollTop = shown.view.scrollDOM.scrollTop;
+        tab.scrollLeft = shown.view.scrollDOM.scrollLeft;
+        if (shown === focusedPane) hideLargeSearch();
       }
+      if (active === tab) active = undefined;
       closedTabs.push(tab);
       tabs.splice(index, 1);
       const historyIndex = selectionHistory.indexOf(tab);
       if (historyIndex !== -1) selectionHistory.splice(historyIndex, 1);
       tab.languageGeneration++;
-      if (active === tab) {
-        active = undefined;
-        if (tabs.length) activate(selectionHistory.at(-1) ?? tabs[Math.min(index, tabs.length - 1)]);
-        else await newTab();
+      const pickReplacement = (): Tab | undefined =>
+        [...selectionHistory].reverse().find(candidate => !paneOfTab(candidate))
+        ?? tabs.find(candidate => !paneOfTab(candidate));
+      for (const pane of [...panes]) {
+        if (pane.tab) continue;
+        const replacement = pickReplacement();
+        if (replacement) {
+          if (pane === focusedPane) activate(replacement);
+          else {
+            showInPane(replacement, pane);
+            void safely(() => ensureLoaded(replacement));
+          }
+        } else if (pane !== primaryPane) closeSplitPane(pane);
       }
+      if (!primaryPane.tab) await newTab();
       renderTabs(); renderStatus();
     });
   });
   return historyQueue;
+}
+async function confirmDelete(message: string): Promise<boolean> {
+  if (!desktop) return false;
+  const { confirm } = await import('@tauri-apps/plugin-dialog');
+  return confirm(message, { title: 'Delete', kind: 'warning', okLabel: 'Delete', cancelLabel: 'Cancel' });
+}
+function underDir(path: string, dir: string): boolean {
+  return path === dir || path.startsWith(`${dir}/`) || path.startsWith(`${dir}\\`);
+}
+async function handleRenamed(oldPath: string, newPath: string, isDirectory: boolean): Promise<void> {
+  const affected = [...tabs, ...closedTabs].filter(tab =>
+    tab.info.path !== null && (isDirectory ? underDir(tab.info.path, oldPath) : tab.info.path === oldPath));
+  const failures: string[] = [];
+  for (const tab of affected) {
+    const next = isDirectory ? newPath + tab.info.path!.slice(oldPath.length) : newPath;
+    try {
+      const info = await call<Info>('retarget_document', { id: tab.info.id, path: next });
+      tab.info = { ...info, name: info.path ? info.name : tab.info.name };
+      remember(tab.info.path);
+    } catch (error) {
+      failures.push(`${tab.info.name}: ${String(error)}`);
+    }
+  }
+  if (affected.length) { renderTabs(); renderStatus(); }
+  if (failures.length) throw new Error(`Renamed on disk, but ${failures.length} open buffer(s) still point at the old path:\n${failures.join('\n')}`);
+}
+async function handleDeleted(path: string, isDirectory: boolean): Promise<void> {
+  const affected = tabs.filter(tab =>
+    tab.info.path !== null && (isDirectory ? underDir(tab.info.path, path) : tab.info.path === path));
+  let kept = 0;
+  for (const tab of [...affected]) {
+    if (dirty(tab)) { kept++; continue; }
+    await closeTab(tab);
+  }
+  if (kept) notify(`Deleted from disk. ${kept} unsaved buffer(s) kept — saving recreates the file.`);
 }
 async function reloadTab(tab = active): Promise<void> {
   await checkpointPromise?.catch(() => {});
@@ -608,16 +859,17 @@ function captureOrigin(): SearchOrigin {
     scrollTop: view.scrollDOM.scrollTop, scrollLeft: view.scrollDOM.scrollLeft };
 }
 let sectionCountGeneration = 0;
-function updateSectionCount(update?: ViewUpdate): void {
-  const state = update?.state ?? view.state;
+function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
+  const target = pane ?? focusedPane;
+  const state = update?.state ?? target.view.state;
   if (!searchPanelOpen(state)) { sectionCountGeneration++; return; }
   const query = getSearchQuery(state);
   if (update && !update.docChanged && searchPanelOpen(update.startState) && query.eq(getSearchQuery(update.startState))) return;
   const generation = ++sectionCountGeneration;
-  const tab = active;
+  const tab = target.tab;
   setTimeout(() => void safely(async () => {
-    if (generation !== sectionCountGeneration || active !== tab) return;
-    const panel = element('.editor-host').querySelector('.cm-search');
+    if (generation !== sectionCountGeneration || target.tab !== tab) return;
+    const panel = target.host.querySelector('.cm-search');
     if (!panel) return;
     let scope = panel.querySelector('.search-scope');
     if (!scope) { scope = document.createElement('div'); scope.className = 'search-scope search-hint'; panel.prepend(scope); }
@@ -867,8 +1119,8 @@ async function convertIndent(tabsMode: boolean): Promise<void> {
   if (active === tab) setIndent(tabsMode ? '\t' : ' '.repeat(width), width);
   else { tab.indent = tabsMode ? '\t' : ' '.repeat(width); applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(width)])); }
 }
-function zoom(delta: number): void { preferences.fontSize = Math.min(28, Math.max(10, preferences.fontSize + delta)); storePreferences(); view.requestMeasure(); }
-function toggleTheme(): void { preferences.theme = preferences.theme === 'dark' ? 'light' : 'dark'; storePreferences(); view.requestMeasure(); }
+function zoom(delta: number): void { preferences.fontSize = Math.min(28, Math.max(10, preferences.fontSize + delta)); storePreferences(); for (const pane of panes) pane.view.requestMeasure(); }
+function toggleTheme(): void { preferences.theme = preferences.theme === 'dark' ? 'light' : 'dark'; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); }
 
 let paletteCommands: Command[] = [];
 let filteredCommands: Command[] = [];
@@ -923,6 +1175,10 @@ function commands(): Command[] {
     { label: 'Increase font size', shortcut: `${mod}+`, run: () => zoom(1) },
     { label: 'Decrease font size', shortcut: `${mod}−`, run: () => zoom(-1) },
     { label: 'Select syntax language…', run: showLanguages },
+    { label: 'Split editor right', shortcut: `${mod}\\`, run: splitRight },
+    { label: 'Focus other pane', run: focusOtherPane },
+    { label: 'Move current tab to other pane', run: moveTabToOtherPane },
+    { label: 'Close split', run: closeSplit },
     { label: 'Quick-open folder files and tabs…', shortcut: `${mod}P`, run: showFiles },
     ...recentPaths.map(path => ({ label: `Open recent: ${path}`, run: () => openPath(path) })),
   ];
@@ -999,6 +1255,8 @@ const actions: Record<string, () => void | Promise<void>> = {
   new: newTab, open: openFiles, reopen: reopenClosedTab, save: async () => { await saveTab(active); }, find,
   'open-folder': folders.open, 'toggle-folder': folders.toggle, 'refresh-folder': folders.refresh, 'close-folder': folders.close,
   palette: showCommands, wrap: toggleWrap, indent: changeIndent, language: showLanguages,
+  split: () => { if (secondaryPane) closeSplit(); else splitRight(); },
+  'focus-other': focusOtherPane, 'move-to-other': moveTabToOtherPane, 'close-split': closeSplit,
 };
 app.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-action]')?.dataset.action;
@@ -1008,17 +1266,18 @@ app.addEventListener('click', event => {
 // so paste, cut, clear, and checkbox changes immediately update the same query.
 function commitSectionQuery(event: Event): void {
   if (shuttingDown || (event instanceof InputEvent && event.isComposing)) return;
+  const host = (event.target as HTMLElement).closest?.('.editor-host');
+  const pane = panes.find(candidate => candidate.host === host) ?? focusedPane;
+  const target = pane.view;
   const panel = (event.target as HTMLElement).closest('.cm-search');
-  if (!panel || !searchPanelOpen(view.state)) return;
+  if (!panel || !searchPanelOpen(target.state)) return;
   const field = (name: string) => panel.querySelector<HTMLInputElement>(`input[name="${name}"]`)!;
   const query = new SearchQuery({
-    search: field('search').value, replace: field('replace')?.value ?? getSearchQuery(view.state).replace,
+    search: field('search').value, replace: field('replace')?.value ?? getSearchQuery(target.state).replace,
     caseSensitive: field('case').checked, regexp: field('re').checked, wholeWord: field('word').checked,
   });
-  if (!query.eq(getSearchQuery(view.state))) view.dispatch({ effects: setSearchQuery.of(query) });
+  if (!query.eq(getSearchQuery(target.state))) target.dispatch({ effects: setSearchQuery.of(query) });
 }
-element('.editor-host').addEventListener('input', commitSectionQuery);
-element('.editor-host').addEventListener('compositionend', commitSectionQuery);
 notice.querySelector('button')!.addEventListener('click', () => { notice.hidden = true; });
 pagebar.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-page]')?.dataset.page;
@@ -1045,6 +1304,10 @@ document.addEventListener('keydown', event => {
   if (event.key !== 'Escape' || !overlay.hidden) return;
   if (!largeSearch.hidden) { event.preventDefault(); event.stopPropagation(); void safely(resetLargeSearch); }
   else if (searchPanelOpen(view.state)) { event.preventDefault(); event.stopPropagation(); resetSectionSearch(); }
+  else {
+    const other = panes.find(pane => pane !== focusedPane && searchPanelOpen(pane.view.state));
+    if (other) { event.preventDefault(); event.stopPropagation(); closeSearchPanel(other.view); }
+  }
 }, true);
 paletteQuery.addEventListener('input', () => {
   paletteIndex = 0; renderPalette();
@@ -1082,7 +1345,7 @@ tabbar.addEventListener('keydown', event => {
 window.addEventListener('beforeunload', event => { if (!desktop && tabs.some(dirty)) event.preventDefault(); });
 
 function sessionView() {
-  return { open: tabs.map(captureTabView), closed: closedTabs.map(captureTabView), active: active?.info.id ?? null, folder: folders.capture() };
+  return { open: tabs.map(captureTabView), closed: closedTabs.map(captureTabView), active: active?.info.id ?? null, secondary: secondaryPane?.tab?.info.id ?? null, folder: folders.capture() };
 }
 function checkpoint(): Promise<void> {
   if (checkpointPromise) return checkpointPromise;
@@ -1199,6 +1462,11 @@ async function initializeDesktop(): Promise<void> {
       const selected = tabs[Math.min(restored.activeIndex, tabs.length - 1)];
       activate(selected);
       await ensureLoaded(selected);
+      const second = typeof restored.secondaryIndex === 'number' ? tabs[restored.secondaryIndex] : undefined;
+      if (second && second !== selected) {
+        const pane = makeSplitPane();
+        showInPane(second, pane);
+      }
     }
     if (restored.errors.length) notify(restored.errors.join('\n'), true);
   } catch (error) { notify(`Could not restore the previous session: ${String(error)}`, true); }

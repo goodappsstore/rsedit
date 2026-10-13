@@ -1194,8 +1194,51 @@ function showCommands(): void { showPalette(commands()); }
 function tabCommands(): Command[] {
   return tabs.map(tab => ({ label: `${dirty(tab) ? '● ' : ''}${tab.info.name}`, shortcut: tab.info.path ?? '', run: () => activate(tab) }));
 }
+function parseFileLine(input: string): { fileQuery: string; line?: number; col?: number } {
+  const trimmed = input.trim();
+  const match = /^(.*?)\s*:\s*(\d+)(?:\s*:\s*(\d+))?\s*$/.exec(trimmed);
+  if (!match) return { fileQuery: trimmed };
+  const line = Number(match[2]);
+  const col = match[3] !== undefined ? Number(match[3]) : undefined;
+  if (!Number.isSafeInteger(line) || line < 1) return { fileQuery: trimmed };
+  if (col !== undefined && (!Number.isSafeInteger(col) || col < 1)) return { fileQuery: trimmed };
+  return { fileQuery: match[1].trim(), line, col };
+}
+function goToLineNumber(line: number, col = 1): void {
+  if (!active) return;
+  const doc = view.state.doc;
+  if (doc.lines === 0) return;
+  const targetLine = Math.min(Math.max(1, Math.floor(line)), doc.lines);
+  const lineInfo = doc.line(targetLine);
+  const targetCol = Math.min(Math.max(1, Math.floor(col)), lineInfo.length + 1);
+  const pos = lineInfo.from + (targetCol - 1);
+  view.dispatch({ selection: EditorSelection.cursor(pos), effects: EditorView.scrollIntoView(pos, { y: 'center' }) });
+  view.focus();
+}
+async function runQuickOpenCommand(command: Command): Promise<void> {
+  const parsed = parseFileLine(paletteQuery.value);
+  if (parsed.line === undefined) {
+    closePalette();
+    await command.run();
+    return;
+  }
+  if (!parsed.fileQuery) {
+    const target = active;
+    closePalette();
+    if (!target) return;
+    if (!target.loaded) await ensureLoaded(target);
+    if (active === target) goToLineNumber(parsed.line, parsed.col ?? 1);
+    return;
+  }
+  closePalette();
+  await command.run();
+  const target = active;
+  if (!target) return;
+  if (!target.loaded) await ensureLoaded(target);
+  if (active === target) goToLineNumber(parsed.line, parsed.col ?? 1);
+}
 function showFiles(): void {
-  showPalette(tabCommands(), 'Quick-open: fuzzy folder path or open tab…');
+  showPalette(tabCommands(), 'Quick-open: file, file:line or open tab…');
   filePalette = true;
   renderPalette();
   void updateQuickOpen();
@@ -1209,7 +1252,7 @@ async function updateQuickOpen(): Promise<void> {
   element('.palette footer').textContent = 'Searching folder on demand…';
   quickOpenInFlight = true; quickOpenPending = false;
   try {
-    const results = await call<QuickOpen>('quick_open', { path: root, query: paletteQuery.value.trim() });
+    const results = await call<QuickOpen>('quick_open', { path: root, query: parseFileLine(paletteQuery.value).fileQuery });
     if (generation !== quickOpenGeneration || !filePalette || overlay.hidden) return;
     const open = new Set(tabs.map(tab => tab.info.path));
     paletteCommands = [...tabCommands(), ...results.entries.filter(entry => !open.has(entry.path)).map(entry => ({ label: entry.name, shortcut: '', run: () => openPath(entry.path) }))];
@@ -1233,8 +1276,9 @@ async function showLanguages(): Promise<void> {
 function closePalette(): void { overlay.hidden = true; filePalette = false; quickOpenPending = false; ++quickOpenGeneration; clearTimeout(quickOpenTimer); view.focus(); }
 function renderPalette(): void {
   const query = paletteQuery.value.toLowerCase();
+  const fileQuery = filePalette ? parseFileLine(paletteQuery.value).fileQuery.toLowerCase().trim() : query;
   filteredCommands = filePalette
-    ? paletteCommands.map(command => ({ command, score: fuzzyScore(`${command.label} ${command.shortcut ?? ''}`, query.trim()) }))
+    ? paletteCommands.map(command => ({ command, score: fuzzyScore(`${command.label} ${command.shortcut ?? ''}`, fileQuery) }))
       .filter((item): item is { command: Command; score: number } => item.score !== undefined)
       .sort((a, b) => b.score - a.score).slice(0, 80).map(item => item.command)
     : paletteCommands.filter(command => command.label.toLowerCase().includes(query));
@@ -1245,7 +1289,10 @@ function renderPalette(): void {
     const label = document.createElement('span'); label.textContent = command.label;
     const shortcut = document.createElement('small'); shortcut.textContent = command.shortcut ?? '';
     button.append(label, shortcut);
-    button.addEventListener('click', () => { closePalette(); void safely(command.run); });
+    button.addEventListener('click', () => {
+      if (filePalette) void safely(() => runQuickOpenCommand(command));
+      else { closePalette(); void safely(command.run); }
+    });
     return button;
   }));
   element('.palette-list').querySelector('.selected')?.scrollIntoView({ block: 'nearest' });
@@ -1321,7 +1368,7 @@ paletteQuery.addEventListener('keydown', event => {
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault(); paletteIndex = (paletteIndex + (event.key === 'ArrowDown' ? 1 : -1) + filteredCommands.length) % (filteredCommands.length || 1); renderPalette();
   }
-  if (event.key === 'Enter') { event.preventDefault(); const command = filteredCommands[paletteIndex]; if (command) { closePalette(); void safely(command.run); } }
+  if (event.key === 'Enter') { event.preventDefault(); const command = filteredCommands[paletteIndex]; if (command) { if (filePalette) void safely(() => runQuickOpenCommand(command)); else { closePalette(); void safely(command.run); } } }
 });
 overlay.addEventListener('click', event => { if (event.target === overlay || (event.target as HTMLElement).closest('[data-palette=close]')) closePalette(); });
 overlay.addEventListener('keydown', event => {

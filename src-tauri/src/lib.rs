@@ -1,6 +1,8 @@
+mod cli;
 mod document;
 mod folder;
 mod session;
+use cli::OpenRequest;
 use document::{Document, Info, Page, SearchResult, SearchScan};
 use session::{RestoredSession, SessionStore, SessionView};
 use std::time::Instant;
@@ -27,7 +29,7 @@ struct Editor {
 struct Startup {
     ready: bool,
     exit_ready: bool,
-    paths: Vec<String>,
+    requests: Vec<OpenRequest>,
 }
 
 impl Editor {
@@ -80,6 +82,28 @@ async fn open_document(editor: State<'_, Editor>, path: String) -> Result<Page, 
     .map_err(|e| e.to_string())??;
     editor.insert(doc)?;
     Ok(page)
+}
+#[tauri::command]
+async fn open_stdin(editor: State<'_, Editor>, path: String) -> Result<Page, String> {
+    let id = editor.id();
+    let (doc, page) = tauri::async_runtime::spawn_blocking(move || {
+        let doc = Document::from_stdin(id, &PathBuf::from(path))?;
+        let page = doc.page(0)?;
+        Ok::<_, String>((doc, page))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    editor.insert(doc)?;
+    Ok(page)
+}
+#[tauri::command]
+async fn document_location(
+    editor: State<'_, Editor>,
+    id: u64,
+    line: u64,
+    col: u64,
+) -> Result<u64, String> {
+    work(editor.get(id)?, move |doc| doc.location_offset(line, col)).await
 }
 #[tauri::command]
 async fn read_directory(path: String) -> Result<folder::FolderListing, String> {
@@ -305,35 +329,39 @@ fn file_view_ready(id: u64, elapsed_ms: f64, clock: State<'_, StartupClock>) {
     }
 }
 #[tauri::command]
-async fn startup_paths(
+fn startup_paths(
     editor: State<'_, Editor>,
     clock: State<'_, StartupClock>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<OpenRequest>, String> {
     if std::env::var_os("RSEDIT_PROFILE_STARTUP").is_some() {
         eprintln!(
             "rsedit: editor ready in {:.1} ms",
             clock.0.elapsed().as_secs_f64() * 1000.0
         );
     }
-    let mut paths = {
-        let mut startup = editor.startup.lock().map_err(|e| e.to_string())?;
-        startup.ready = true;
-        std::mem::take(&mut startup.paths)
+    let mut startup = editor.startup.lock().map_err(|e| e.to_string())?;
+    startup.ready = true;
+    Ok(std::mem::take(&mut startup.requests))
+}
+
+fn dispatch_open(app: &tauri::AppHandle, requests: Vec<OpenRequest>) {
+    if requests.is_empty() {
+        return;
+    }
+    let editor = app.state::<Editor>();
+    if let Ok(mut startup) = editor.startup.lock() {
+        if !startup.ready || app.emit("editor-open", &requests).is_err() {
+            startup.requests.extend(requests);
+        }
     };
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
-    paths.extend(
-        tauri::async_runtime::spawn_blocking(move || {
-            args.into_iter()
-                .filter_map(|arg| {
-                    let path = PathBuf::from(arg);
-                    path.is_file().then(|| path.to_string_lossy().into_owned())
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|e| e.to_string())?,
-    );
-    Ok(paths)
+}
+
+fn focus_editor(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
 fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
@@ -389,9 +417,36 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
 
 pub fn run() {
     let started = Instant::now();
+    match cli::forward_stdin() {
+        Ok(Some(code)) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("rsedit: {error}");
+            std::process::exit(1);
+        }
+        Ok(None) => (),
+    }
+    let editor = Editor::default();
+    editor
+        .startup
+        .lock()
+        .expect("Could not initialize launch requests")
+        .requests = cli::requests(
+        std::env::args_os().skip(1),
+        &std::env::current_dir().expect("Could not resolve the launch directory"),
+    );
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            focus_editor(app);
+            dispatch_open(
+                app,
+                cli::requests(
+                    args.into_iter().skip(1).map(Into::into),
+                    &PathBuf::from(cwd),
+                ),
+            );
+        }))
         .plugin(tauri_plugin_dialog::init())
-        .manage(Editor::default())
+        .manage(editor)
         .manage(StartupClock(started))
         .setup(|app| {
             app.manage(SessionStore::new(
@@ -406,6 +461,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             new_document,
             open_document,
+            open_stdin,
+            document_location,
             read_directory,
             read_page,
             replace_range,
@@ -447,19 +504,13 @@ pub fn run() {
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         tauri::RunEvent::Opened { urls } => {
-            let paths: Vec<String> = urls
+            let requests = urls
                 .into_iter()
                 .filter_map(|url| url.to_file_path().ok())
-                .map(|path| path.to_string_lossy().into_owned())
+                .map(|path| cli::path_request(path.into_os_string(), &PathBuf::new()))
                 .collect();
-            let editor = app.state::<Editor>();
-            if let Ok(mut startup) = editor.startup.lock() {
-                if startup.ready {
-                    let _ = app.emit("editor-open", &paths);
-                } else {
-                    startup.paths.extend(paths);
-                }
-            };
+            focus_editor(app);
+            dispatch_open(app, requests);
         }
         _ => (),
     });

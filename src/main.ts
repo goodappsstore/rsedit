@@ -8,7 +8,7 @@ import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, set
 import { indentUnit } from '@codemirror/language';
 import { undo, redo, toggleComment, selectAll, copyLineDown, moveLineUp, moveLineDown, deleteLine } from '@codemirror/commands';
 import { call, desktop, formatBytes } from './api';
-import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, ExternalChange, QuickOpen, ReplaceResult } from './api';
+import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, ExternalChange, QuickOpen, ReplaceResult, OpenRequest } from './api';
 import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, wrapSlot } from './editor';
 import { createFolderPanel } from './folders';
 
@@ -633,30 +633,73 @@ function renderStatus(): void {
   }
   updateTitle();
 }
-const opening = new Set<string>();
+const opening = new Map<string, Promise<void>>();
 async function openPath(path: string): Promise<void> {
   const existing = tabs.find(t => t.info.path === path);
-  if (existing) { activate(existing); return; }
-  if (opening.has(path)) return;
-  opening.add(path);
+  if (existing) { activate(existing); await ensureLoaded(existing); return; }
+  const inProgress = opening.get(path);
+  if (inProgress) {
+    await inProgress;
+    const tab = tabs.find(t => t.info.path === path);
+    if (tab) activate(tab);
+    return;
+  }
   const started = performance.now();
-  try {
+  const operation = (async () => {
     const page = await call<Page>('open_document', { path });
     const duplicate = tabs.find(t => t.info.path === page.info.path);
-    if (duplicate) { await call('close_document', { id: page.info.id }); activate(duplicate); return; }
+    if (duplicate) { await call('close_document', { id: page.info.id }); activate(duplicate); await ensureLoaded(duplicate); return; }
     await addPage(page);
     if (desktop) requestAnimationFrame(() => requestAnimationFrame(() => {
       void call('file_view_ready', { id: page.info.id, elapsedMs: performance.now() - started }).catch(() => {});
     }));
     if (page.info.paged) notify('Opened a bounded view for fast browsing. Edits save the entire file; undo spans views. Use Find for whole-file literal replacement. Line numbers and selections are view-relative.');
     else notice.hidden = true;
-  } finally { opening.delete(path); }
+  })().finally(() => { opening.delete(path); });
+  opening.set(path, operation);
+  await operation;
 }
 async function openFiles(): Promise<void> {
   if (!desktop) throw new Error('Run npm run tauri dev to open files in the desktop app.');
   const { open } = await import('@tauri-apps/plugin-dialog');
   const result = await open({ multiple: true, directory: false, title: 'Open text files' });
   for (const path of typeof result === 'string' ? [result] : result ?? []) await safely(() => openPath(path));
+}
+let launchReady = false;
+const pendingLaunchRequests: OpenRequest[] = [];
+let launchQueue: Promise<void> = Promise.resolve();
+async function openRequest(request: OpenRequest): Promise<void> {
+  if (request.kind === 'error') throw new Error(request.message);
+  if (request.kind === 'folder') { await folders.restore({ path: request.path, visible: true }); return; }
+  if (request.kind === 'stdin') { await addPage(await call<Page>('open_stdin', { path: request.path })); return; }
+  await openPath(request.path);
+  const tab = tabs.find(tab => tab.info.path === request.path);
+  if (!tab || request.line === null) return;
+  await ensureLoaded(tab);
+  if (!tabs.includes(tab)) return;
+  activate(tab);
+  if (!tab.info.paged) { goToLineNumber(request.line, request.col ?? 1); return; }
+  await locked(tab, async () => {
+    cancelSearch();
+    await flush(tab);
+    const offset = await call<number>('document_location', { id: tab.info.id, line: request.line, col: request.col ?? 1 });
+    const page = await call<Page>('read_page', { id: tab.info.id, offset: Math.max(0, offset - 1024) });
+    if (page.start !== tab.pageStart) tab.previous.push(tab.pageStart);
+    installPage(tab, page);
+    const prefix = new TextDecoder().decode(new TextEncoder().encode(page.text).subarray(0, offset - page.start));
+    const position = (page.info.eol === 'CRLF' ? prefix.replaceAll('\r\n', '\n') : prefix).length;
+    const selection = EditorSelection.cursor(Math.min(position, tab.state.doc.length));
+    const shown = paneOfTab(tab);
+    if (shown) shown.view.dispatch({ selection, effects: EditorView.scrollIntoView(selection.head, { y: 'center' }) });
+    else tab.state = tab.state.update({ selection }).state;
+  });
+}
+function enqueueLaunchRequests(requests: OpenRequest[]): Promise<void> {
+  if (!launchReady) { pendingLaunchRequests.push(...requests); return Promise.resolve(); }
+  launchQueue = launchQueue.catch(() => {}).then(async () => {
+    for (const request of requests) await safely(() => openRequest(request));
+  });
+  return launchQueue;
 }
 async function flush(tab: Tab, force = false): Promise<void> {
   if (!tab.pending && !force) return;
@@ -1497,7 +1540,7 @@ async function initializeDesktop(): Promise<void> {
     else if (action === 'redo') void safely(() => history(true));
     else if (actions[action]) void safely(actions[action]);
   });
-  await listen<string[]>('editor-open', event => { void safely(async () => { for (const path of event.payload) await safely(() => openPath(path)); }); });
+  await listen<OpenRequest[]>('editor-open', event => { void enqueueLaunchRequests(event.payload); });
   try {
     const restored = await call<RestoredSession>('restore_session');
     sessionReady = true;
@@ -1518,8 +1561,10 @@ async function initializeDesktop(): Promise<void> {
     if (restored.errors.length) notify(restored.errors.join('\n'), true);
   } catch (error) { notify(`Could not restore the previous session: ${String(error)}`, true); }
   if (!tabs.length) await newTab();
-  const paths = await call<string[]>('startup_paths');
-  for (const path of paths) await safely(() => openPath(path));
+  const requests = await call<OpenRequest[]>('startup_paths');
+  for (const request of requests) await safely(() => openRequest(request));
+  launchReady = true;
+  await enqueueLaunchRequests(pendingLaunchRequests.splice(0));
   setInterval(() => { void checkpoint(); }, 30_000);
   setTimeout(() => { void checkpoint(); void safely(checkExternalChanges); }, 1000);
 }

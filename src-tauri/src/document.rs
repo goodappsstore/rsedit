@@ -264,9 +264,39 @@ impl Document {
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
         Self::open_file(id, path, true)
     }
+    pub fn from_stdin(id: u64, path: &Path) -> Result<Self, String> {
+        // Only consume our private spool files, never an arbitrary user file.
+        if !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("rsedit-stdin-"))
+            || path.parent().and_then(|p| fs::canonicalize(p).ok())
+                != fs::canonicalize(std::env::temp_dir()).ok()
+            || !fs::symlink_metadata(path)
+                .map_err(err)?
+                .file_type()
+                .is_file()
+        {
+            return Err("Invalid stdin handoff file.".into());
+        }
+        let cleanup = tempfile::TempPath::try_from_path(path).map_err(err)?;
+        let mut input = File::open(&cleanup).map_err(err)?;
+        let mut buffer = tempfile::tempfile().map_err(err)?;
+        io::copy(&mut input, &mut buffer).map_err(err)?;
+        drop(input);
+        drop(cleanup);
+        Self::from_file(id, buffer, None, true)
+    }
     fn open_file(id: u64, path: &Path, validate_small: bool) -> Result<Self, String> {
         let path = fs::canonicalize(path).map_err(err)?;
         let file = File::open(&path).map_err(err)?;
+        Self::from_file(id, file, Some(path), validate_small)
+    }
+    fn from_file(
+        id: u64,
+        file: File,
+        path: Option<PathBuf>,
+        validate_small: bool,
+    ) -> Result<Self, String> {
         let metadata = file.metadata().map_err(err)?;
         if !metadata.is_file() {
             return Err("Choose a regular text file.".into());
@@ -286,10 +316,15 @@ impl Document {
         let bom = sample.starts_with(&[0xef, 0xbb, 0xbf]);
         let start = if bom { 3 } else { 0 };
         let size = metadata.len() - start;
+        let unsaved = path.is_none();
         let mut doc = Self {
             id,
-            path: Some(path),
-            stamp: Some(Stamp::from_metadata(&metadata)?),
+            path,
+            stamp: if unsaved {
+                None
+            } else {
+                Some(Stamp::from_metadata(&metadata)?)
+            },
             pieces: vec![Piece {
                 source: Source::disk(file)?,
                 start,
@@ -297,13 +332,13 @@ impl Document {
             }],
             size,
             revision: 0,
-            dirty: false,
+            dirty: unsaved,
             paged: size > SMALL_LIMIT,
             recovered: false,
             undo: vec![],
             redo: vec![],
             version: 0,
-            saved_version: Some(0),
+            saved_version: if unsaved { None } else { Some(0) },
             bom,
             eol: if sample.windows(2).any(|b| b == b"\r\n") {
                 "CRLF"
@@ -542,6 +577,69 @@ impl Document {
             }];
         }
         Ok(page)
+    }
+    /// Resolve a whole-document, one-based location with bounded memory. Columns
+    /// use UTF-16 units, matching CodeMirror; never stop inside a UTF-8 scalar.
+    pub fn location_offset(&self, line: u64, col: u64) -> Result<u64, String> {
+        if line == 0 || col == 0 {
+            return Err("Line and column must be positive.".into());
+        }
+        self.check_source()?;
+        let mut cursor = 0;
+        let mut current_line = 1;
+        let mut line_start = 0;
+        let mut previous_cr = false;
+        while cursor < self.size && current_line < line {
+            let bytes = self.read_range(cursor, (self.size - cursor).min(IO_SIZE))?;
+            for (index, &byte) in bytes.iter().enumerate() {
+                if byte == b'\n' && (self.eol == "LF" || previous_cr) {
+                    current_line += 1;
+                    line_start = cursor + index as u64 + 1;
+                    if current_line == line {
+                        break;
+                    }
+                }
+                previous_cr = byte == b'\r';
+            }
+            cursor += bytes.len() as u64;
+        }
+        cursor = line_start;
+        let mut remaining = col - 1;
+        let separator = if self.eol == "CRLF" { "\r\n" } else { "\n" };
+        while cursor < self.size && remaining > 0 {
+            let mut bytes = self.read_range(cursor, (self.size - cursor).min(IO_SIZE))?;
+            if cursor + (bytes.len() as u64) < self.size {
+                if let Err(error) = std::str::from_utf8(&bytes) {
+                    if error.error_len().is_some() {
+                        return Err("This section is not valid UTF-8 text.".into());
+                    }
+                    bytes.truncate(error.valid_up_to());
+                }
+                if self.eol == "CRLF" && bytes.last() == Some(&b'\r') {
+                    bytes.pop();
+                }
+            }
+            let text = std::str::from_utf8(&bytes).map_err(err)?;
+            let end = text.find(separator).unwrap_or(text.len());
+            for (index, character) in text[..end].char_indices() {
+                let width = character.len_utf16() as u64;
+                if remaining < width {
+                    self.check_source()?;
+                    return Ok(cursor + index as u64);
+                }
+                remaining -= width;
+                if remaining == 0 {
+                    self.check_source()?;
+                    return Ok(cursor + index as u64 + character.len_utf8() as u64);
+                }
+            }
+            cursor += end as u64;
+            if end < text.len() {
+                break;
+            }
+        }
+        self.check_source()?;
+        Ok(cursor)
     }
     pub fn replace(
         &mut self,

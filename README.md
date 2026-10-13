@@ -59,7 +59,7 @@ all platforms listed above.
   plus up to 50 closed tabs.
 
 Open files through the dialog, drag them into the window, or pass paths to the
-executable. macOS Open With is supported. Use **File → Open Folder…** to browse
+executable. CLI launches reuse and focus the running window. macOS Open With is supported. Use **File → Open Folder…** to browse
 a folder; entries load on expansion and refresh manually. **Mod+P** fuzzy-matches
 open tabs and relative paths beneath that folder. Folder search runs only when
 requested, with no persistent index. Each request returns at most 80 results
@@ -84,6 +84,34 @@ file, or to convert its leading indentation. Detection samples the first 64 KiB;
 ambiguous or mixed indentation may need an explicit choice. Changing the setting
 affects future input; conversion is a separate undoable command and preserves
 alignment using the selected tab width. The setting is retained in the session.
+
+## Command line
+
+With the rsedit executable on your `PATH`:
+
+```sh
+rsedit notes.txt                 # Open a file
+rsedit src/main.ts:42            # Go to line 42
+rsedit src/main.ts:42:8          # Go to line 42, column 8
+rsedit .                        # Browse the current directory
+rsedit ./project notes.txt:10:2  # Open a folder and a file
+printf 'Hello\n' | rsedit -      # Open stdin as an unsaved buffer
+rsedit - < output.txt           # Redirected stdin
+```
+
+Paths resolve from the invoking shell's working directory, including when a
+window is already open. Quote paths containing spaces. Lines and columns are
+one-based; columns use UTF-16 units as in the editor, and out-of-range positions
+clamp to the last line or the end of that line. An existing filename containing
+colons takes precedence over location syntax. Locations in huge files scan to
+the requested line on a worker with bounded memory, then show the relevant view;
+the view's displayed line numbers remain relative to that view.
+
+`-` reads UTF-8 stdin until EOF into a temporary disk buffer before opening it.
+The resulting untitled tab participates in session recovery and uses Save As;
+the redirected source is never overwritten. Repeated `-` arguments open that
+input once. For a file literally named `-`, use `./-`. Invalid paths and unsupported
+text are reported in the editor. Use `--` before paths beginning with a dash.
 
 ## Keyboard shortcuts
 

@@ -12,6 +12,11 @@ export interface Info {
   eol: 'LF' | 'CRLF';
 }
 export interface Page { text: string; start: number; end: number; info: Info }
+export type OpenRequest =
+  | { kind: 'file'; path: string; line: number | null; col: number | null }
+  | { kind: 'folder'; path: string }
+  | { kind: 'stdin'; path: string }
+  | { kind: 'error'; message: string };
 export interface FolderEntry { name: string; path: string; isDirectory: boolean }
 export interface FolderListing { name: string; path: string; entries: FolderEntry[] }
 export interface FolderView { path: string; visible: boolean }

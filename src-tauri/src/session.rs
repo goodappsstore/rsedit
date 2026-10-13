@@ -176,6 +176,9 @@ impl SessionStore {
                             });
                         }
                     }
+                    // Clean files may have been moved or deleted between sessions.
+                    // Drop stale entries, but preserve failures involving recovery data.
+                    Err(_) if entry.document.missing_source_file() => {}
                     Err(error) => {
                         restored
                             .errors

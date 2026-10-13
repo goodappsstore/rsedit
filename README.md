@@ -208,6 +208,8 @@ to log editor and newly opened view readiness.
 Quitting preserves open tabs and unsaved buffers without prompts. Individual
 unsaved tab closes still ask. Tabs restore lazily, retaining position and language
 choice; undo history starts fresh after restart.
+Clean tabs whose source files have moved or been deleted are silently skipped
+and removed from the saved session.
 
 Session copies are separate from your files. Use **Save** or **Save As** to
 write edits to disk. Recovery data lives in the app data directory's `session/`

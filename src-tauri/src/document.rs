@@ -96,6 +96,14 @@ pub struct SavedPiece {
     len: u64,
 }
 impl SavedDocument {
+    pub fn missing_source_file(&self) -> bool {
+        !self.dirty
+            && self.buffer.is_none()
+            && self.pieces.is_none()
+            && self.path.as_ref().is_some_and(|path| {
+                fs::metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            })
+    }
     pub fn buffers(&self) -> impl Iterator<Item = &PathBuf> {
         self.buffer
             .iter()

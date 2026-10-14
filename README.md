@@ -78,6 +78,8 @@ current one. Click either side to focus it; the toolbar, search panels, page
 navigation, and status bar follow focus. The tab strip is shared: clicking a
 tab shows it in the focused pane, and closing a pane never closes its file.
 The split restores with the session; the divider width is remembered.
+The editor receives keyboard focus after startup restores the session and opens
+any launch files, so you can start typing immediately.
 
 Click the indentation indicator to choose spaces or literal tabs for the current
 file, or to convert its leading indentation. Detection samples the first 64 KiB;

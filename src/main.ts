@@ -1565,6 +1565,7 @@ async function initializeDesktop(): Promise<void> {
   for (const request of requests) await safely(() => openRequest(request));
   launchReady = true;
   await enqueueLaunchRequests(pendingLaunchRequests.splice(0));
+  view.focus();
   setInterval(() => { void checkpoint(); }, 30_000);
   setTimeout(() => { void checkpoint(); void safely(checkExternalChanges); }, 1000);
 }

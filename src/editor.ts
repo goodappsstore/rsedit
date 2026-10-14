@@ -25,7 +25,12 @@ const matchField = StateField.define<DecorationSet>({
   },
   provide: field => EditorView.decorations.from(field),
 });
+// Default styles first: they cover tags the custom rules below don't define
+// (markdown headings, emphasis, links, ...). A separate fallback highlighter
+// only applies when no other highlighter is registered, so the specs must be
+// merged here; later rules win for tags defined in both lists.
 const colors = HighlightStyle.define([
+  ...defaultHighlightStyle.specs,
   { tag: tags.keyword, color: 'var(--syntax-keyword)' },
   { tag: [tags.string, tags.special(tags.string)], color: 'var(--syntax-string)' },
   { tag: [tags.number, tags.bool, tags.null], color: 'var(--syntax-number)' },
@@ -78,7 +83,7 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
       EditorState.lineSeparator.of(page.info.eol === 'CRLF' ? '\r\n' : '\n'),
       languageSlot.of([]), wrapSlot.of(options.wrap ? EditorView.lineWrapping : []),
       indentSlot.of([indentUnit.of(options.indent), EditorState.tabSize.of(options.tabSize)]),
-      syntaxHighlighting(colors), syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+      syntaxHighlighting(colors),
       ...(page.info.paged ? [] : [
         bracketMatching(), closeBrackets(), indentOnInput(), foldGutter(),
         selectionMatchesSlot.of(highlightSelectionMatches()),

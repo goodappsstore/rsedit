@@ -328,11 +328,12 @@ focus interactions, and Windows/Linux runtime behavior remain unverified.
 
 ## Releases
 
-[CI](.github/workflows/ci.yml) checks tag pushes on macOS, Windows, and Linux.
-Branch pushes, pull requests, and manual dispatches do not trigger workflows.
-The [release workflow](.github/workflows/release.yml) runs only on `v*` tag pushes,
-builds six native targets, and publishes after verifying all twelve installers. Failures
-leave a draft; published installers require a new version to replace.
+The [release workflow](.github/workflows/release.yml) is the only workflow and
+runs on `v*` tag pushes. It checks frontend and Rust builds, formatting, and
+Clippy on all six native targets, builds installers, and publishes after verifying
+all twelve installers. Branch pushes, pull requests, and manual dispatches do not
+trigger workflows. Failures leave a draft; published installers require a new
+version to replace.
 
 To prepare a release, commit your current work, then run:
 

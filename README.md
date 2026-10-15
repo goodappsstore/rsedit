@@ -212,8 +212,9 @@ to log editor and newly opened view readiness.
 ## Sessions and file safety
 
 Quitting preserves open tabs and unsaved buffers without prompts. Individual
-unsaved tab closes still ask. Tabs restore lazily, retaining position and language
-choice; undo history starts fresh after restart.
+unsaved tab closes still ask. Tabs retain position and language choice; ordinary
+small files restore into memory, while huge files keep bounded disk-backed views.
+Undo history starts fresh after restart.
 Clean tabs whose source files have moved or been deleted are silently skipped
 and removed from the saved session.
 
@@ -231,11 +232,17 @@ quit restore the last completed checkpoint; newer edits can still be lost.
 For edited huge files, the first checkpoint streams an immutable copy of each
 source into the session directory. Later checkpoints reuse those copies and
 store changed bytes plus piece references, including after recovery restart.
+After a successful checkpoint, live disk-backed pieces and matching undo/redo
+history read from the completed private recovery copies, so later external
+overwrites cannot invalidate those bytes.
 Unchanged buffers reuse their last snapshot. The manifest is replaced only after
 all new recovery data is synced; an interrupted checkpoint leaves the previous
 manifest usable. A corrupt/unreadable manifest and failed recovery buffers are
-preserved. The window stays open if its final checkpoint fails. Recovery copies
-can take seconds and require disk space, especially after a whole-file operation.
+preserved. If a tab cannot be checkpointed and has a previous snapshot, that
+snapshot is retained while other tabs are checkpointed. Without a previous
+snapshot, the existing manifest is preserved. Errors identify affected
+files and warn that newer edits are not saved. The window stays open if its
+final checkpoint fails. Recovery copies can take seconds and require disk space, especially after a whole-file operation.
 
 rsedit supports UTF-8 text, including a BOM and LF/CRLF. Binary and UTF-16 files
 are rejected; huge files are validated view by view. New editor line breaks use
@@ -251,8 +258,8 @@ with a discard prompt. Repeated notices for the same disk version are suppressed
 There is no live watcher or power-loss recovery guarantee. Symlinks resolve to
 their target; hard links, extended metadata, and ACLs may not survive replacement.
 
-If an original disk-backed huge-file source changes externally, rsedit cannot
-safely reconstruct unseen old bytes. Use **Copy visible text to a new recovery
+If an original disk-backed huge-file source changes externally before its first
+successful recovery copy, rsedit cannot safely reconstruct unseen old bytes. Use **Copy visible text to a new recovery
 tab** before reloading, and retain the last successful checkpoint. Fully loaded,
 restored, or completely transformed buffers can be rescued with **Save As** to
 another path. rsedit never silently overwrites an external change.

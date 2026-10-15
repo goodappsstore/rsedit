@@ -245,16 +245,32 @@ impl SessionStore {
         };
         let mut sources = state.sources.clone();
         let mut snapshots = std::collections::HashMap::new();
+        let mut failures = Vec::new();
+        let mut documents = Vec::new();
         for (closed, entries) in [(false, view.open), (true, view.closed)] {
             for tab in entries {
                 let shared = editor.get(tab.id)?;
                 // Capture immutable pieces briefly; disk streaming must not block editing.
                 let doc = shared.lock().map_err(err)?.clone();
-                let key = doc.checkpoint_key()?;
-                let document = match state.snapshots.get(&tab.id) {
-                    Some((prior_key, saved)) if *prior_key == key => saved.clone(),
-                    _ => doc.snapshot(stage.path(), relative, &mut sources)?,
+                let result = (|| {
+                    let key = doc.checkpoint_key()?;
+                    let document = match state.snapshots.get(&tab.id) {
+                        Some((prior_key, saved)) if *prior_key == key => saved.clone(),
+                        _ => doc.snapshot(stage.path(), relative, &mut sources)?,
+                    };
+                    Ok::<_, String>((key, document))
+                })();
+                let (key, document) = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let Some(previous) = state.snapshots.get(&tab.id) else {
+                            return Err(format!("Could not preserve {}: {error}", tab.name));
+                        };
+                        failures.push(format!("{}: {error} Its last successful checkpoint was retained; newer edits are not saved.", tab.name));
+                        previous.clone()
+                    }
                 };
+                documents.push(shared);
                 snapshots.insert(tab.id, (key, document.clone()));
                 let entry = SavedTab {
                     document,
@@ -287,7 +303,27 @@ impl SessionStore {
             .flat_map(|tab| tab.document.buffers().cloned())
             .collect();
         sources.retain(&paths);
+        for shared in documents {
+            match shared.lock() {
+                Ok(mut doc) => {
+                    if let Err(error) = sources.protect(&mut doc, &self.directory) {
+                        failures.push(format!(
+                            "Could not attach the completed recovery copy: {error}"
+                        ));
+                    }
+                }
+                Err(error) => failures.push(err(error)),
+            }
+        }
         state.sources = sources;
+        let result = if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Available recovery data was preserved, but some buffers need attention: {}",
+                failures.join("\n")
+            ))
+        };
         // Only reclaim generations absent from the newly committed manifest.
         let keep: std::collections::HashSet<_> = saved
             .open
@@ -298,7 +334,7 @@ impl SessionStore {
             .map(|c| c.as_os_str().to_os_string())
             .collect();
         if !state.unrestored_open.is_empty() || !state.unrestored_closed.is_empty() {
-            return Ok(());
+            return result;
         }
         if let Ok(entries) = fs::read_dir(&self.directory) {
             for entry in entries.flatten() {
@@ -310,6 +346,6 @@ impl SessionStore {
                 }
             }
         }
-        Ok(())
+        result
     }
 }

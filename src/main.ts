@@ -1438,6 +1438,21 @@ window.addEventListener('beforeunload', event => { if (!desktop && tabs.some(dir
 function sessionView() {
   return { open: tabs.map(captureTabView), closed: closedTabs.map(captureTabView), active: active?.info.id ?? null, secondary: secondaryPane?.tab?.info.id ?? null, folder: folders.capture() };
 }
+async function persistBuffers(buffers: Tab[], alreadyLocked = false): Promise<void> {
+  const failures: string[] = [];
+  for (const tab of buffers) {
+    if (!tab.pending) continue;
+    try {
+      if (alreadyLocked) await flush(tab);
+      else await locked(tab, () => flush(tab));
+    } catch (error) {
+      failures.push(`${tab.info.name}: pending edits could not be checkpointed: ${String(error)}`);
+    }
+  }
+  try { await call('persist_session', { view: sessionView() }); }
+  catch (error) { failures.push(String(error)); }
+  if (failures.length) throw new Error(failures.join('\n'));
+}
 function checkpoint(): Promise<void> {
   if (checkpointPromise) return checkpointPromise;
   if (!sessionReady || shuttingDown) return Promise.resolve();
@@ -1449,13 +1464,12 @@ function checkpoint(): Promise<void> {
     const status = element('.recovery');
     status.textContent = 'Checkpointing…';
     try {
-      for (const tab of buffers) if (tab.pending) await locked(tab, () => flush(tab));
-      await call('persist_session', { view: sessionView() });
+      await persistBuffers(buffers);
       status.textContent = [...tabs, ...closedTabs].some(tab => tab.pending) ? 'Recovery saved · newer edits pending' : 'Recovery saved';
       status.title = `Last successful recovery checkpoint: ${new Date().toLocaleTimeString()}`;
     } catch (error) {
       status.textContent = 'Recovery failed';
-      notify(`Recovery checkpoint failed. The previous checkpoint is preserved: ${String(error)}`, true);
+      notify(`Recovery needs attention. Keep the affected buffers open: ${String(error)}`, true);
     }
   })().finally(() => { checkpointPromise = undefined; });
   return checkpointPromise;
@@ -1514,8 +1528,7 @@ async function initializeDesktop(): Promise<void> {
         lockedTabs = [...tabs, ...closedTabs];
         for (const tab of lockedTabs) { tab.busy = true; applyEffect(tab, lockSlot.reconfigure(lockExtension(true))); }
         notify('Preserving session…');
-        for (const tab of lockedTabs) await flush(tab);
-        await call('persist_session', { view: sessionView() });
+        await persistBuffers(lockedTabs, true);
         // Capture the final state while the native window still exists.
         await call('persist_window_state');
         await nativeWindow.destroy();

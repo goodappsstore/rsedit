@@ -113,6 +113,7 @@ impl SavedDocument {
 #[derive(Clone, Default)]
 pub struct SnapshotSources {
     sources: std::collections::HashMap<usize, (Source, PathBuf)>,
+    protected: std::collections::HashMap<usize, Source>,
 }
 impl SnapshotSources {
     pub fn register_recovery(&mut self, doc: &Document, saved: &SavedDocument) {
@@ -131,6 +132,55 @@ impl SnapshotSources {
     }
     pub fn retain(&mut self, paths: &std::collections::HashSet<PathBuf>) {
         self.sources.retain(|_, (_, path)| paths.contains(path));
+        self.protected
+            .retain(|key, _| self.sources.contains_key(key));
+    }
+    /// Move live pieces and history onto completed, private recovery sources.
+    /// This also covers edits made while the checkpoint was streaming.
+    pub fn protect(&mut self, doc: &mut Document, directory: &Path) -> Result<(), String> {
+        let mut candidate = doc.clone();
+        for (pieces, recovered) in
+            std::iter::once((&mut candidate.pieces, &mut candidate.recovered)).chain(
+                candidate
+                    .undo
+                    .iter_mut()
+                    .chain(&mut candidate.redo)
+                    .map(|state| (&mut state.pieces, &mut state.recovered)),
+            )
+        {
+            let mut independent = true;
+            for piece in pieces {
+                let Source::Disk(file, stamp) = &piece.source else {
+                    continue;
+                };
+                let key = Arc::as_ptr(file) as usize;
+                let Some((_, path)) = self.sources.get(&key).cloned() else {
+                    independent = false;
+                    continue;
+                };
+                let replacement = if let Some(source) = self.protected.get(&key) {
+                    source.clone()
+                } else {
+                    let file = File::open(directory.join(&path)).map_err(err)?;
+                    if file.metadata().map_err(err)?.len() != stamp.size {
+                        return Err("A completed recovery source changed size.".into());
+                    }
+                    let source = Source::disk(file)?;
+                    self.protected.insert(key, source.clone());
+                    source
+                };
+                if let Source::Disk(file, _) = &replacement {
+                    let replacement_key = Arc::as_ptr(file) as usize;
+                    self.sources
+                        .insert(replacement_key, (replacement.clone(), path));
+                    self.protected.insert(replacement_key, replacement.clone());
+                }
+                piece.source = replacement;
+            }
+            *recovered |= independent;
+        }
+        *doc = candidate;
+        Ok(())
     }
     fn copy(
         &mut self,
@@ -148,8 +198,13 @@ impl SnapshotSources {
         let name = format!("source-{}.bin", self.sources.len());
         let mut output = File::create(directory.join(&name)).map_err(err)?;
         match source {
-            Source::Disk(file, _) => {
-                let length = file.metadata().map_err(err)?.len();
+            Source::Disk(file, stamp) => {
+                if Stamp::from_metadata(&file.metadata().map_err(err)?)? != *stamp {
+                    return Err(
+                        "The disk source changed before it could be copied for recovery.".into(),
+                    );
+                }
+                let length = stamp.size;
                 let mut buffer = vec![0; IO_SIZE as usize];
                 let mut offset = 0;
                 while offset < length {
@@ -157,6 +212,11 @@ impl SnapshotSources {
                     read_exact_at(file, &mut buffer[..count], offset)?;
                     output.write_all(&buffer[..count]).map_err(err)?;
                     offset += count as u64;
+                }
+                if Stamp::from_metadata(&file.metadata().map_err(err)?)? != *stamp {
+                    return Err(
+                        "The disk source changed while it was being copied for recovery.".into(),
+                    );
                 }
             }
             Source::Edit(bytes) => output.write_all(bytes).map_err(err)?,
@@ -862,7 +922,7 @@ impl Document {
                 .path
                 .as_ref()
                 .ok_or("The session has no file or buffer.")?;
-            let mut doc = Self::open_file(id, path, false)?;
+            let mut doc = Self::open_file(id, path, true)?;
             doc.paged |= saved.paged;
             return Ok(doc);
         };

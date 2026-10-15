@@ -134,7 +134,8 @@ text are reported in the editor. Use `--` before paths beginning with a dash.
 | Command palette | Mod+Shift+P |
 | Quick-open folder files / open tabs | Mod+P |
 | Split editor right / close split | Mod+\ |
-| Next / Previous tab | Ctrl+Tab / Ctrl+Shift+Tab |
+| Previous / Next tab | Mod+Shift+[ / Mod+Shift+] |
+| Next / Previous tab (alternate) | Ctrl+Tab / Ctrl+Shift+Tab |
 | Undo / Redo | Mod+Z / Mod+Shift+Z |
 | Select next occurrence | Mod+D |
 | Select all occurrences (visible view for huge files) | Mod+Shift+L |

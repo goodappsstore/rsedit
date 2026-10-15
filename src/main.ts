@@ -167,6 +167,8 @@ const shortcuts = keymap.of([
   { key: 'Mod-g', run: () => { gotoLine(view); return true; } },
   { key: 'Mod-Shift-w', run: () => { toggleWrap(); return true; } },
   { key: 'Mod-\\', run: () => { if (secondaryPane) closeSplit(); else splitRight(); return true; } },
+  { key: 'Mod-Shift-[', run: () => { cycleTab(-1); return true; } },
+  { key: 'Mod-Shift-]', run: () => { cycleTab(1); return true; } },
   { key: 'Ctrl-Tab', run: () => { cycleTab(1); return true; } },
   { key: 'Ctrl-Shift-Tab', run: () => { cycleTab(-1); return true; } },
   { key: 'Mod-=', run: () => { zoom(1); return true; } },
@@ -1178,6 +1180,8 @@ function commands(): Command[] {
     { label: 'Save all files', run: async () => { for (const tab of [...tabs]) if (dirty(tab) && !await saveTab(tab)) break; } },
     { label: 'Reopen closed file', shortcut: `${mod}⇧T`, run: reopenClosedTab },
     { label: 'Close file', shortcut: `${mod}W`, run: () => closeTab(active) },
+    { label: 'Previous tab', shortcut: `${mod}⇧[`, run: () => cycleTab(-1) },
+    { label: 'Next tab', shortcut: `${mod}⇧]`, run: () => cycleTab(1) },
     { label: active?.info.paged ? 'Find / replace literal text in entire file' : 'Find / replace in entire file', shortcut: `${mod}F`, run: find },
     ...(active?.info.paged ? [{ label: 'Find / replace in visible view only', shortcut: `${mod}H`, run: () => { openSectionSearch(); } }] : []),
     { label: active?.info.paged ? 'Go to line (visible view)' : 'Go to line', shortcut: `${mod}G`, run: () => { gotoLine(view); } },
@@ -1402,6 +1406,12 @@ overlay.addEventListener('keydown', event => {
 document.addEventListener('keydown', event => {
   if (event.defaultPrevented || !overlay.hidden || !(mac ? event.metaKey : event.ctrlKey)) return;
   const key = event.key.toLowerCase();
+  if (event.shiftKey && !event.altKey) {
+    // Shifted square brackets may arrive as braces, depending on the keyboard layout.
+    const direction = key === '[' || key === '{' || event.code === 'BracketLeft' ? -1
+      : key === ']' || key === '}' || event.code === 'BracketRight' ? 1 : 0;
+    if (direction) { event.preventDefault(); cycleTab(direction); return; }
+  }
   const action = key === 'o' ? (event.altKey ? folders.open : openFiles) : key === 'n' ? newTab : key === 's' ? async () => { await saveTab(active, event.shiftKey); }
     : key === 't' && event.shiftKey ? reopenClosedTab : key === 'w' ? () => closeTab(active) : key === 'p' ? (event.shiftKey ? showCommands : showFiles) : undefined;
   if (action) { event.preventDefault(); void safely(action); }

@@ -1,6 +1,6 @@
 [package]
 name = "rsedit"
-version = "0.1.4"
+version = "0.1.6"
 description = "A fast, focused text editor with a Rust file engine"
 repository = "https://github.com/goodappsstore/rsedit"
 homepage = "https://goodapps.store/rsedit/"

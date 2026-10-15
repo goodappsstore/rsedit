@@ -95,7 +95,7 @@ app.innerHTML = `
     <section class="large-search" aria-label="Search entire large file" hidden>
       <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
       <div class="search-row"><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with (literal text)" /><button data-search="replace-all">Replace all in entire file</button></div>
-      <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: restore position. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
+      <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: close search. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
       
     </section>
     <div class="split-row"></div>
@@ -172,7 +172,7 @@ const shortcuts = keymap.of([
   { key: 'Mod-=', run: () => { zoom(1); return true; } },
   { key: 'Mod--', run: () => { zoom(-1); return true; } },
   { key: 'Mod-0', run: () => { preferences.fontSize = 14; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); return true; } },
-  { key: 'Escape', run: () => { if (!largeSearch.hidden) { void safely(resetLargeSearch); return true; } if (searchPanelOpen(view.state)) { resetSectionSearch(); return true; } return false; } },
+  { key: 'Escape', run: () => { if (!largeSearch.hidden) { closeLargeSearch(); return true; } if (searchPanelOpen(view.state)) { closeSectionSearch(); return true; } return false; } },
 ]);
 interface Pane {
   element: HTMLElement;
@@ -372,7 +372,8 @@ function changed(update: ViewUpdate): void {
   tab.state = update.state;
   updateSectionCount(update, pane);
   if (update.docChanged) {
-    for (const origin of [largeOrigin, sectionOrigin]) if (origin?.tab === tab && origin.pageStart === tab.pageStart) {
+    const origin = largeOrigin;
+    if (origin?.tab === tab && origin.pageStart === tab.pageStart) {
       origin.selection = origin.selection.map(update.changes);
       origin.byteOffset = tab.pageStart + new TextEncoder().encode(update.state.sliceDoc(0, origin.selection.main.head)).length;
     }
@@ -534,7 +535,6 @@ function activate(tab: Tab): void {
     return;
   }
   hideLargeSearch();
-  sectionOrigin = undefined;
   const pane = focusedPane;
   if (pane.tab) {
     pane.tab.scrollTop = pane.view.scrollDOM.scrollTop;
@@ -854,7 +854,7 @@ async function reloadTab(tab = active): Promise<void> {
     if (!await approveDiscard(tab)) return;
     const page = await call<Page>('open_document', { path: tab.info.path });
     await call('close_document', { id: tab.info.id });
-    hideLargeSearch(); sectionOrigin = undefined;
+    hideLargeSearch();
     tab.previous = []; tab.externalToken = undefined;
     Object.assign(tab, detectIndent(page.text));
     installPage(tab, page);
@@ -884,7 +884,6 @@ async function changePage(offset: number, selectionOffset?: number, previous = f
 }
 interface SearchOrigin {
   tab: Tab; pageStart: number; selection: EditorSelection; byteOffset: number;
-  scrollTop: number; scrollLeft: number;
 }
 interface LargeFind {
   tab: Tab; query: string; generation: number; revision: number;
@@ -895,12 +894,10 @@ const SCAN_SIZE = 64 * 1024 * 1024;
 let searchGeneration = 0;
 let largeFind: LargeFind | undefined;
 let largeOrigin: SearchOrigin | undefined;
-let sectionOrigin: SearchOrigin | undefined;
 let searchTimer: ReturnType<typeof setTimeout> | undefined;
 function captureOrigin(): SearchOrigin {
   return { tab: active!, pageStart: active!.pageStart, selection: view.state.selection,
-    byteOffset: active!.pageStart + new TextEncoder().encode(view.state.sliceDoc(0, view.state.selection.main.head)).length,
-    scrollTop: view.scrollDOM.scrollTop, scrollLeft: view.scrollDOM.scrollLeft };
+    byteOffset: active!.pageStart + new TextEncoder().encode(view.state.sliceDoc(0, view.state.selection.main.head)).length };
 }
 let sectionCountGeneration = 0;
 function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
@@ -940,26 +937,15 @@ function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
 function openSectionSearch(): void {
   if (!active) return;
   if (!largeSearch.hidden) hideLargeSearch();
-  if (!searchPanelOpen(view.state)) sectionOrigin = captureOrigin();
   openSearchPanel(view);
 }
-function restoreViewport(origin: SearchOrigin): void {
-  if (active !== origin.tab) return;
-  const ranges = origin.selection.ranges.map(range => EditorSelection.range(Math.min(range.anchor, view.state.doc.length), Math.min(range.head, view.state.doc.length)));
-  view.dispatch({ selection: EditorSelection.create(ranges, origin.selection.mainIndex), effects: currentMatch.of(null) });
-  view.requestMeasure({ read: () => null, write: () => {
-    if (active === origin.tab) { view.scrollDOM.scrollTop = origin.scrollTop; view.scrollDOM.scrollLeft = origin.scrollLeft; }
-  } });
-  view.focus();
-}
-function resetSectionSearch(): void {
-  const origin = sectionOrigin; sectionOrigin = undefined;
+function closeSectionSearch(): void {
   closeSearchPanel(view);
-  if (origin) restoreViewport(origin);
+  view.focus();
 }
 function showLargeSearch(): void {
   if (!active) return;
-  if (searchPanelOpen(view.state)) { closeSearchPanel(view); sectionOrigin = undefined; }
+  if (searchPanelOpen(view.state)) closeSearchPanel(view);
   if (largeSearch.hidden) {
     largeOrigin = captureOrigin();
     element('.match-count').textContent = '0 matches';
@@ -976,18 +962,9 @@ function cancelSearch(): void {
   clearTimeout(searchTimer);
 }
 function hideLargeSearch(): void { cancelSearch(); if (active) applyEffect(active, currentMatch.of(null)); largeSearch.hidden = true; largeOrigin = undefined; }
-async function resetLargeSearch(): Promise<void> {
-  const origin = largeOrigin;
+function closeLargeSearch(): void {
   hideLargeSearch();
-  if (!origin || active !== origin.tab) return;
-  const generation = searchGeneration;
-  // Escape may arrive while a match's section is still loading.
-  while (origin.tab.busy) {
-    await new Promise<void>(resolve => setTimeout(resolve, 16));
-    if (active !== origin.tab || generation !== searchGeneration) return;
-  }
-  if (origin.tab.pageStart !== origin.pageStart) await changePage(origin.pageStart);
-  restoreViewport(origin);
+  view.focus();
 }
 function validSearch(session: LargeFind): boolean {
   return largeFind === session && session.generation === searchGeneration && active === session.tab
@@ -1114,7 +1091,7 @@ async function history(forward: boolean): Promise<void> {
   if (!tab || tab.busy) return;
   if (!tab.info.paged) { (forward ? redo : undo)(view); return; }
   await locked(tab, async () => {
-    cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+    cancelSearch(); largeOrigin = undefined;
     await flush(tab);
     const page = await call<Page>('document_history', { id: tab.info.id, redo: forward, offset: tab.pageStart, revision: tab.info.revision });
     installPage(tab, page);
@@ -1126,7 +1103,7 @@ async function replaceEntireFile(): Promise<void> {
   const query = queryInput.value;
   const replacement = element<HTMLInputElement>('.large-replacement').value;
   await locked(tab, async () => {
-    cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+    cancelSearch(); largeOrigin = undefined;
     notify(`Replacing literal text in the entire ${tab.info.name}. Your file is written only when you Save…`);
     await flush(tab);
     const result = await call<ReplaceResult>('replace_entire_file', { id: tab.info.id, query, replacement, revision: tab.info.revision });
@@ -1140,7 +1117,7 @@ async function convertIndent(tabsMode: boolean): Promise<void> {
   const width = tab.tabSize;
   if (tab.info.paged) {
     await locked(tab, async () => {
-      cancelSearch(); sectionOrigin = undefined; largeOrigin = undefined;
+      cancelSearch(); largeOrigin = undefined;
       notify(`Converting indentation across the entire ${tab.info.name}…`);
       await flush(tab);
       const page = await call<Page>('convert_document_indent', { id: tab.info.id, tabs: tabsMode, width, revision: tab.info.revision });
@@ -1382,7 +1359,7 @@ largeSearch.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-search]')?.dataset.search;
   if (action === 'start') void safely(() => searchLarge());
   if (action === 'replace-all') void safely(replaceEntireFile);
-  if (action === 'close') void safely(resetLargeSearch);
+  if (action === 'close') closeLargeSearch();
 });
 queryInput.addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); void safely(() => searchLarge(event.shiftKey ? -1 : 1)); }
@@ -1393,8 +1370,8 @@ queryInput.addEventListener('input', () => {
 });
 document.addEventListener('keydown', event => {
   if (event.key !== 'Escape' || !overlay.hidden) return;
-  if (!largeSearch.hidden) { event.preventDefault(); event.stopPropagation(); void safely(resetLargeSearch); }
-  else if (searchPanelOpen(view.state)) { event.preventDefault(); event.stopPropagation(); resetSectionSearch(); }
+  if (!largeSearch.hidden) { event.preventDefault(); event.stopPropagation(); closeLargeSearch(); }
+  else if (searchPanelOpen(view.state)) { event.preventDefault(); event.stopPropagation(); closeSectionSearch(); }
   else {
     const other = panes.find(pane => pane !== focusedPane && searchPanelOpen(pane.view.state));
     if (other) { event.preventDefault(); event.stopPropagation(); closeSearchPanel(other.view); }

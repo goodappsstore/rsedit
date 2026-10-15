@@ -130,6 +130,7 @@ text are reported in the editor. Use `--` before paths beginning with a dash.
 | Save As | Mod+Shift+S |
 | Close / Reopen tab | Mod+W / Mod+Shift+T |
 | Find | Mod+F |
+| Close search and keep current match | Escape |
 | Command palette | Mod+Shift+P |
 | Quick-open folder files / open tabs | Mod+P |
 | Split editor right / close split | Mod+\ |
@@ -333,9 +334,21 @@ The [release workflow](.github/workflows/release.yml) runs only on `v*` tag push
 builds six native targets, and publishes after verifying all twelve installers. Failures
 leave a draft; published installers require a new version to replace.
 
-Before pushing a `vMAJOR.MINOR.PATCH` tag, align the version in `package.json`,
+To prepare a release, commit your current work, then run:
+
+```sh
+node .github/scripts/prepare-release.mjs v0.1.5
+```
+
+The script requires a clean working tree and a new `vMAJOR.MINOR.PATCH` tag.
+It aligns the version in `package.json`,
 `package-lock.json` (both root entries), `src-tauri/tauri.conf.json`,
-`src-tauri/Cargo.toml`, and the rsedit entry in `src-tauri/Cargo.lock`.
+`src-tauri/Cargo.toml`, and the rsedit entry in `src-tauri/Cargo.lock`, runs the
+release validator, creates a `Release vMAJOR.MINOR.PATCH` commit, and creates an
+annotated local tag on that commit. It does **not** push anything. If a Git
+commit or tag command fails, inspect the local changes before retrying.
+
+To validate release metadata separately:
 
 ```sh
 node .github/scripts/check-release.mjs v0.1.0

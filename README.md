@@ -50,7 +50,7 @@ all platforms listed above.
 - Syntax highlighting for Rust, JavaScript, TypeScript, Python, JSON, Markdown,
   SQL, shell, and more. Language parsers load on demand.
 - Command palette, fuzzy quick-open within the selected folder, light/dark
-  themes, word wrap, and adjustable font size.
+  themes, word wrap (enabled by default), and adjustable font size.
 - Per-file indentation detection, literal tabs or 2/4/8 spaces, and explicit
   whole-file indentation conversion.
 - Focus-time checks for external file changes, with clean-buffer reload and
@@ -80,6 +80,10 @@ tab shows it in the focused pane, and closing a pane never closes its file.
 The split restores with the session; the divider width is remembered.
 The editor receives keyboard focus after startup restores the session and opens
 any launch files, so you can start typing immediately.
+
+The window remembers its last size, position, and maximized or full-screen mode
+across launches. Word wrap remembers your preference; toggle it from
+**View → Word Wrap**, the **Wrap** toolbar button, or **Mod+Shift+W**.
 
 Click the indentation indicator to choose spaces or literal tabs for the current
 file, or to convert its leading indentation. Detection samples the first 64 KiB;

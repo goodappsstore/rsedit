@@ -15,6 +15,12 @@ use std::{
     },
 };
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+
+const WINDOW_STATE_FLAGS: StateFlags = StateFlags::SIZE
+    .union(StateFlags::POSITION)
+    .union(StateFlags::MAXIMIZED)
+    .union(StateFlags::FULLSCREEN);
 
 struct StartupClock(Instant);
 
@@ -364,8 +370,27 @@ fn focus_editor(app: &tauri::AppHandle) {
     }
 }
 
+#[tauri::command]
+fn persist_window_state(app: tauri::AppHandle) -> Result<(), String> {
+    app.save_window_state(WINDOW_STATE_FLAGS)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_word_wrap_menu(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let item = app
+        .menu()
+        .and_then(|menu| menu.get("view"))
+        .and_then(|item| item.as_submenu()?.get("wrap"))
+        .ok_or("The Word Wrap menu item is unavailable.")?;
+    item.as_check_menuitem()
+        .ok_or("The Word Wrap menu item is not checkable.")?
+        .set_checked(enabled)
+        .map_err(|e| e.to_string())
+}
+
 fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+    use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
     let item = |id: &str, label: &str, accelerator: &str| {
         MenuItemBuilder::with_id(id, label)
             .accelerator(accelerator)
@@ -394,8 +419,14 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .item(&item("find", "Find / Replace", "CmdOrCtrl+F")?)
         .build()?;
     let view = SubmenuBuilder::new(app, "View")
+        .id("view")
         .item(&item("palette", "Command Palette", "CmdOrCtrl+Shift+P")?)
-        .text("wrap", "Toggle Word Wrap")
+        .item(
+            &CheckMenuItemBuilder::with_id("wrap", "Word Wrap")
+                .checked(true)
+                .accelerator("CmdOrCtrl+Shift+W")
+                .build(app)?,
+        )
         .text("theme", "Toggle Theme")
         .text("toggle-folder", "Toggle Folder Panel")
         .separator()
@@ -446,6 +477,11 @@ pub fn run() {
             );
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(WINDOW_STATE_FLAGS)
+                .build(),
+        )
         .manage(editor)
         .manage(StartupClock(started))
         .setup(|app| {
@@ -484,7 +520,9 @@ pub fn run() {
             startup_paths,
             file_view_ready,
             restore_session,
-            persist_session
+            persist_session,
+            persist_window_state,
+            set_word_wrap_menu
         ])
         .build(tauri::generate_context!())
         .expect("Could not start rsedit");

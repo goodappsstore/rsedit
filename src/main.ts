@@ -43,7 +43,7 @@ function readStored<T>(key: string, fallback: T): T {
 }
 const stored = readStored<Partial<Preferences>>('rsedit.preferences', {});
 const preferences: Preferences = {
-  theme: stored.theme === 'light' ? 'light' : 'dark', wrap: stored.wrap === true,
+  theme: stored.theme === 'light' ? 'light' : 'dark', wrap: stored.wrap !== false,
   indent: [2, 4, 8].includes(Number(stored.indent)) ? Number(stored.indent) : 4,
   fontSize: Number.isFinite(stored.fontSize) ? Math.min(28, Math.max(10, Number(stored.fontSize))) : 14,
 };
@@ -73,7 +73,7 @@ app.innerHTML = `
     <button data-action="split" title="Split editor right">Split</button>
     <div class="spacer"></div>
     <button data-action="palette" class="quiet" title="Command palette">Commands <small>${mod}⇧P</small></button>
-    <button data-action="wrap" title="Toggle word wrap" aria-pressed="false">Wrap</button>
+    <button data-action="wrap" title="Toggle word wrap" aria-pressed="${preferences.wrap}">Wrap</button>
   </header>
   <div class="workbench">
     <aside class="folder-panel" aria-label="Folder files" hidden>
@@ -139,6 +139,7 @@ function storePreferences(): void {
   document.documentElement.style.setProperty('--font-size', `${preferences.fontSize}px`);
   try { localStorage.setItem('rsedit.preferences', JSON.stringify(preferences)); } catch { /* Storage may be disabled. */ }
   element('[data-action=wrap]').setAttribute('aria-pressed', String(preferences.wrap));
+  if (desktop) void safely(() => call('set_word_wrap_menu', { enabled: preferences.wrap }));
 }
 function remember(path: string | null): void {
   if (!path) return;
@@ -1515,6 +1516,8 @@ async function initializeDesktop(): Promise<void> {
         notify('Preserving session…');
         for (const tab of lockedTabs) await flush(tab);
         await call('persist_session', { view: sessionView() });
+        // Capture the final state while the native window still exists.
+        await call('persist_window_state');
         await nativeWindow.destroy();
       } catch (error) {
         throw new Error(`Could not finish preserving and closing the session. The editor remains open: ${String(error)}`);

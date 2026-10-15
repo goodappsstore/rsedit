@@ -49,8 +49,9 @@ all platforms listed above.
 - Find/replace with regex, case and whole-word options, and match counts.
 - Syntax highlighting for Rust, JavaScript, TypeScript, Python, JSON, Markdown,
   SQL, shell, and more. Language parsers load on demand.
-- Command palette, fuzzy quick-open within the selected folder, light/dark
-  themes, word wrap (enabled by default), and adjustable font size.
+- Command palette, fuzzy quick-open within the selected folder, ten themes
+  (Rsedit Dark/Light, Monokai, Dracula, Nord, Solarized Dark/Light, One Dark,
+  Gruvbox Dark, Tokyo Night), word wrap (enabled by default), and adjustable font size.
 - Per-file indentation detection, literal tabs or 2/4/8 spaces, and explicit
   whole-file indentation conversion.
 - Focus-time checks for external file changes, with clean-buffer reload and

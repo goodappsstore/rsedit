@@ -427,7 +427,8 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
                 .accelerator("CmdOrCtrl+Shift+W")
                 .build(app)?,
         )
-        .text("theme", "Toggle Theme")
+        .text("theme", "Next Theme")
+        .text("select-theme", "Select Theme…")
         .text("toggle-folder", "Toggle Folder Panel")
         .separator()
         .text("split", "Split Editor Right")

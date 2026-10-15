@@ -10,6 +10,7 @@ import { undo, redo, toggleComment, selectAll, copyLineDown, moveLineUp, moveLin
 import { call, desktop, formatBytes } from './api';
 import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, ExternalChange, QuickOpen, ReplaceResult, OpenRequest } from './api';
 import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, wrapSlot } from './editor';
+import { THEMES, applyTheme, getTheme, normalizeThemeId } from './themes';
 import { createFolderPanel } from './folders';
 
 interface Tab {
@@ -34,8 +35,8 @@ interface Tab {
   tabSize: number;
   externalToken?: string;
 }
-interface Preferences { theme: 'dark' | 'light'; wrap: boolean; indent: number; fontSize: number }
-interface Command { label: string; shortcut?: string; run: () => void | Promise<void> }
+interface Preferences { theme: string; wrap: boolean; indent: number; fontSize: number }
+interface Command { label: string; shortcut?: string; run: () => void | Promise<void>; preview?: () => void }
 const mac = /Mac|iPhone|iPad/.test(navigator.platform);
 const mod = mac ? '⌘' : 'Ctrl+';
 function readStored<T>(key: string, fallback: T): T {
@@ -43,7 +44,7 @@ function readStored<T>(key: string, fallback: T): T {
 }
 const stored = readStored<Partial<Preferences>>('rsedit.preferences', {});
 const preferences: Preferences = {
-  theme: stored.theme === 'light' ? 'light' : 'dark', wrap: stored.wrap !== false,
+  theme: normalizeThemeId(stored.theme), wrap: stored.wrap !== false,
   indent: [2, 4, 8].includes(Number(stored.indent)) ? Number(stored.indent) : 4,
   fontSize: Number.isFinite(stored.fontSize) ? Math.min(28, Math.max(10, Number(stored.fontSize))) : 14,
 };
@@ -135,7 +136,9 @@ async function safely(action: () => unknown | Promise<unknown>): Promise<void> {
   try { await action(); } catch (error) { notify(String(error instanceof Error ? error.message : error), true); }
 }
 function storePreferences(): void {
-  document.documentElement.dataset.theme = preferences.theme;
+  const theme = getTheme(preferences.theme);
+  preferences.theme = theme.id;
+  applyTheme(theme);
   document.documentElement.style.setProperty('--font-size', `${preferences.fontSize}px`);
   try { localStorage.setItem('rsedit.preferences', JSON.stringify(preferences)); } catch { /* Storage may be disabled. */ }
   element('[data-action=wrap]').setAttribute('aria-pressed', String(preferences.wrap));
@@ -1143,7 +1146,42 @@ async function convertIndent(tabsMode: boolean): Promise<void> {
   else { tab.indent = tabsMode ? '\t' : ' '.repeat(width); applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(width)])); }
 }
 function zoom(delta: number): void { preferences.fontSize = Math.min(28, Math.max(10, preferences.fontSize + delta)); storePreferences(); for (const pane of panes) pane.view.requestMeasure(); }
-function toggleTheme(): void { preferences.theme = preferences.theme === 'dark' ? 'light' : 'dark'; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); }
+function setTheme(id: string): void {
+  themePreviewOriginal = undefined;
+  preferences.theme = normalizeThemeId(id);
+  storePreferences();
+  for (const pane of panes) pane.view.requestMeasure();
+}
+// Live preview while the theme picker is open. Previewing only applies the
+// theme visually; preferences are updated when the user confirms a choice.
+let themePreviewOriginal: string | undefined;
+function previewTheme(id: string): void {
+  applyTheme(getTheme(normalizeThemeId(id)));
+  for (const pane of panes) pane.view.requestMeasure();
+}
+function cancelThemePreview(): void {
+  if (themePreviewOriginal === undefined) return;
+  const original = themePreviewOriginal;
+  themePreviewOriginal = undefined;
+  previewTheme(original);
+}
+function nextTheme(): void {
+  const index = THEMES.findIndex(theme => theme.id === preferences.theme);
+  const next = THEMES[(index + 1 + THEMES.length) % THEMES.length];
+  setTheme(next.id);
+  notify(`Theme: ${next.label}.`);
+}
+function showThemes(): void {
+  themePreviewOriginal = preferences.theme;
+  showPalette(THEMES.map(theme => ({
+    label: `${theme.id === preferences.theme ? '● ' : ''}${theme.label}`,
+    run: () => setTheme(theme.id),
+    preview: () => previewTheme(theme.id),
+  })), 'Select theme…');
+  // Highlight the current theme so opening the picker doesn't preview another one.
+  paletteIndex = Math.max(0, THEMES.findIndex(theme => theme.id === themePreviewOriginal));
+  renderPalette();
+}
 
 let paletteCommands: Command[] = [];
 let filteredCommands: Command[] = [];
@@ -1195,7 +1233,8 @@ function commands(): Command[] {
     { label: active?.info.paged ? 'Select all occurrences in visible view' : 'Select all occurrences', shortcut: `${mod}⇧L`, run: () => { selectSelectionMatches(view); } },
     { label: 'Toggle line comment', shortcut: `${mod}/`, run: () => { toggleComment(view); } },
     { label: `${preferences.wrap ? 'Disable' : 'Enable'} word wrap`, shortcut: `${mod}⇧W`, run: toggleWrap },
-    { label: `Switch to ${preferences.theme === 'dark' ? 'light' : 'dark'} theme`, run: toggleTheme },
+    { label: `Next theme (current: ${getTheme(preferences.theme).label})`, run: nextTheme },
+    { label: 'Select theme…', run: showThemes },
     { label: 'Set or convert indentation for this file…', run: changeIndent },
     { label: 'Increase font size', shortcut: `${mod}+`, run: () => zoom(1) },
     { label: 'Decrease font size', shortcut: `${mod}−`, run: () => zoom(-1) },
@@ -1298,7 +1337,7 @@ async function showLanguages(): Promise<void> {
   const { languages } = await import('@codemirror/language-data');
   showPalette(['Plain text', ...languages.map(l => l.name)].map(name => ({ label: name, run: () => loadLanguage(tab, name) })), 'Select a syntax language…');
 }
-function closePalette(): void { overlay.hidden = true; filePalette = false; quickOpenPending = false; ++quickOpenGeneration; clearTimeout(quickOpenTimer); view.focus(); }
+function closePalette(): void { cancelThemePreview(); overlay.hidden = true; filePalette = false; quickOpenPending = false; ++quickOpenGeneration; clearTimeout(quickOpenTimer); view.focus(); }
 function renderPalette(): void {
   const query = paletteQuery.value.toLowerCase();
   const fileQuery = filePalette ? parseFileLine(paletteQuery.value).fileQuery.toLowerCase().trim() : query;
@@ -1314,6 +1353,17 @@ function renderPalette(): void {
     const label = document.createElement('span'); label.textContent = command.label;
     const shortcut = document.createElement('small'); shortcut.textContent = command.shortcut ?? '';
     button.append(label, shortcut);
+    const highlight = (): void => {
+      if (index === paletteIndex) { command.preview?.(); return; }
+      paletteIndex = index;
+      element('.palette-list').querySelectorAll('.palette-item').forEach((item, itemIndex) => {
+        item.classList.toggle('selected', itemIndex === paletteIndex);
+        item.setAttribute('aria-selected', String(itemIndex === paletteIndex));
+      });
+      command.preview?.();
+    };
+    button.addEventListener('mouseenter', highlight);
+    button.addEventListener('focus', highlight);
     button.addEventListener('click', () => {
       if (filePalette) void safely(() => runQuickOpenCommand(command));
       else { closePalette(); void safely(command.run); }
@@ -1321,6 +1371,8 @@ function renderPalette(): void {
     return button;
   }));
   element('.palette-list').querySelector('.selected')?.scrollIntoView({ block: 'nearest' });
+  // Live-preview the highlighted entry (theme picker). No-op for other palettes.
+  filteredCommands[paletteIndex]?.preview?.();
 }
 
 const actions: Record<string, () => void | Promise<void>> = {
@@ -1537,7 +1589,9 @@ async function initializeDesktop(): Promise<void> {
     const action = event.payload;
     if (action === 'quit') void nativeWindow.close();
     else if (action === 'save-as') void safely(async () => { await saveTab(active, true); });
-    else if (action === 'theme') toggleTheme();
+    else if (action === 'theme') nextTheme();
+    else if (action === 'select-theme') showThemes();
+    else if (action.startsWith('theme:')) setTheme(action.slice('theme:'.length));
     else if (action === 'close') void safely(() => closeTab(active));
     else if (action === 'undo') void safely(() => history(false));
     else if (action === 'redo') void safely(() => history(true));

@@ -1,7 +1,7 @@
 import './style.css';
 import { EditorSelection, EditorState, StateEffect } from '@codemirror/state';
 import type { Text } from '@codemirror/state';
-import { EditorView, keymap, placeholder } from '@codemirror/view';
+import { EditorView, keymap, panels, placeholder } from '@codemirror/view';
 import type { ViewUpdate } from '@codemirror/view';
 import { Compartment } from '@codemirror/state';
 import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, setSearchQuery, SearchQuery, gotoLine, selectSelectionMatches } from '@codemirror/search';
@@ -9,7 +9,7 @@ import { indentUnit } from '@codemirror/language';
 import { undo, redo, toggleComment, selectAll, copyLineDown, moveLineUp, moveLineDown, deleteLine } from '@codemirror/commands';
 import { call, desktop, formatBytes } from './api';
 import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, ExternalChange, QuickOpen, ReplaceResult, OpenRequest } from './api';
-import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, wrapSlot } from './editor';
+import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, panelSlot, wrapSlot } from './editor';
 import { THEMES, applyTheme, getTheme, normalizeThemeId } from './themes';
 import { createFolderPanel } from './folders';
 
@@ -93,13 +93,14 @@ app.innerHTML = `
       <input class="byte-offset" type="number" min="0" step="1" aria-label="Go to byte offset" placeholder="Byte offset" />
       <button data-page="jump">Go</button>
     </div>
+    <div class="split-row"></div>
     <section class="large-search" aria-label="Search entire large file" hidden>
       <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
       <div class="search-row"><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with (literal text)" /><button data-search="replace-all">Replace all in entire file</button></div>
       <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: close search. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
       
     </section>
-    <div class="split-row"></div>
+    <div class="search-dock"></div>
   </main>
     </div>
   </div>
@@ -121,6 +122,7 @@ const tabbar = element('.tabs');
 const notice = element('.notice');
 const pagebar = element('.pagebar');
 const largeSearch = element('.large-search');
+const searchDock = element('.search-dock');
 const overlay = element('.overlay');
 const paletteQuery = element<HTMLInputElement>('.palette-query');
 const queryInput = element<HTMLInputElement>('.large-query');
@@ -182,6 +184,7 @@ const shortcuts = keymap.of([
 interface Pane {
   element: HTMLElement;
   host: HTMLElement;
+  searchHost: HTMLElement;
   view: EditorView;
   tab?: Tab;
 }
@@ -205,8 +208,11 @@ function makePane(): Pane {
   const host = document.createElement('div');
   host.className = 'editor-host';
   element.append(host);
+  const searchHost = document.createElement('div');
+  searchHost.hidden = panes.length > 0;
+  searchDock.append(searchHost);
   const pane: Pane = {
-    element, host,
+    element, host, searchHost,
     view: new EditorView({
       parent: host,
       state: EditorState.create({
@@ -219,8 +225,9 @@ function makePane(): Pane {
     }),
   };
   pane.view.dom.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
-  host.addEventListener('input', commitSectionQuery);
-  host.addEventListener('compositionend', commitSectionQuery);
+  searchHost.addEventListener('input', commitSectionQuery);
+  searchHost.addEventListener('compositionend', commitSectionQuery);
+  searchHost.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
   panes.push(pane);
   return pane;
 }
@@ -229,6 +236,7 @@ function paneOfTab(tab: Tab): Pane | undefined {
 }
 function showInPane(tab: Tab, pane: Pane): void {
   pane.tab = tab;
+  tab.state = tab.state.update({ effects: panelSlot.reconfigure(panels({ bottomContainer: pane.searchHost })) }).state;
   pane.view.setState(tab.state);
   pane.view.scrollDOM.scrollTop = tab.scrollTop;
   pane.view.scrollDOM.scrollLeft = tab.scrollLeft;
@@ -239,6 +247,8 @@ function focusPane(pane: Pane, focusEditor = true): void {
   focusedPane = pane;
   view = pane.view;
   active = pane.tab;
+  for (const candidate of panes) candidate.searchHost.hidden = candidate !== pane;
+  updateSectionCount(undefined, pane);
   pane.view.requestMeasure();
   renderTabs(); renderStatus();
   if (pane.tab && !pane.tab.loaded) void safely(() => ensureLoaded(pane.tab!));
@@ -308,6 +318,7 @@ function closeSplitPane(pane: Pane): void {
   }
   pane.view.destroy();
   pane.element.remove();
+  pane.searchHost.remove();
   splitDivider?.remove();
   splitDivider = undefined;
   panes.splice(index, 1);
@@ -435,7 +446,7 @@ function installPage(tab: Tab, page: Page): void {
   tab.loaded = true;
   tab.scrollTop = tab.scrollLeft = 0;
   const shown = paneOfTab(tab);
-  if (shown) { shown.view.setState(tab.state); updateSectionCount(undefined, shown); if (shown === focusedPane) shown.view.focus(); }
+  if (shown) { showInPane(tab, shown); if (shown === focusedPane) shown.view.focus(); }
   void loadLanguage(tab);
   renderTabs(); renderStatus();
 }
@@ -915,11 +926,14 @@ function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
   const tab = target.tab;
   setTimeout(() => void safely(async () => {
     if (generation !== sectionCountGeneration || target.tab !== tab) return;
-    const panel = target.host.querySelector('.cm-search');
+    const panel = target.searchHost.querySelector('.cm-search');
     if (!panel) return;
-    let scope = panel.querySelector('.search-scope');
-    if (!scope) { scope = document.createElement('div'); scope.className = 'search-scope search-hint'; panel.prepend(scope); }
-    scope.textContent = tab?.info.paged ? 'Visible view only (including Replace all). Use whole-file search for literal replacement across the file.' : 'Entire file';
+    if (tab?.info.paged && !panel.querySelector('.search-scope')) {
+      const scope = document.createElement('div');
+      scope.className = 'search-scope search-hint';
+      scope.textContent = 'Visible view only (including Replace all). Use whole-file search for literal replacement across the file.';
+      panel.prepend(scope);
+    }
     let counter = panel.querySelector<HTMLSpanElement>('.section-match-count');
     if (!counter) {
       counter = document.createElement('span'); counter.className = 'section-match-count match-count';
@@ -1390,8 +1404,7 @@ app.addEventListener('click', event => {
 // so paste, cut, clear, and checkbox changes immediately update the same query.
 function commitSectionQuery(event: Event): void {
   if (shuttingDown || (event instanceof InputEvent && event.isComposing)) return;
-  const host = (event.target as HTMLElement).closest?.('.editor-host');
-  const pane = panes.find(candidate => candidate.host === host) ?? focusedPane;
+  const pane = panes.find(candidate => candidate.searchHost.contains(event.target as Node)) ?? focusedPane;
   const target = pane.view;
   const panel = (event.target as HTMLElement).closest('.cm-search');
   if (!panel || !searchPanelOpen(target.state)) return;

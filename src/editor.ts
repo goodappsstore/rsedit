@@ -11,6 +11,7 @@ import type { Page } from './api';
 
 export const languageSlot = new Compartment();
 export const wrapSlot = new Compartment();
+export const panelSlot = new Compartment();
 export const indentSlot = new Compartment();
 const selectionMatchesSlot = new Compartment();
 export const currentMatch = StateEffect.define<{ from: number; to: number } | null>();
@@ -95,7 +96,8 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
             : { effects: selectionMatchesSlot.reconfigure(open ? [] : highlightSelectionMatches()) };
         }),
       ]),
-      search({ top: true, scrollToMatch: range => EditorView.scrollIntoView(range, { x: 'center', y: 'center', xMargin: 32, yMargin: 40 }) }),
+      panelSlot.of([]),
+      search({ top: false, scrollToMatch: range => EditorView.scrollIntoView(range, { x: 'center', y: 'center', xMargin: 32, yMargin: 40 }) }),
       Prec.highest(options.shortcuts),
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, ...searchKeymap, indentWithTab]),
       placeholder('Start typing, or open a file.'),

@@ -46,7 +46,8 @@ all platforms listed above.
 - Tabs, recent files, drag-and-drop opening, and a resizable folder panel.
 - Split editor panes side by side, with a draggable divider and session restore.
 - Multiple cursors, rectangular selection, indentation, and comment shortcuts.
-- Find/replace with regex, case and whole-word options, and match counts.
+- Full-width bottom find/replace panel with regex, case and whole-word options,
+  and match counts.
 - Syntax highlighting for Rust, JavaScript, TypeScript, Python, JSON, Markdown,
   SQL, shell, and more. Language parsers load on demand.
 - Command palette, fuzzy quick-open within the selected folder, ten themes

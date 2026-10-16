@@ -76,7 +76,7 @@ file closes its clean tabs but keeps edited buffers, which offer Save As to
 survive.
 
 **Mod+\\** (or View → Split Editor Right) shows a second file beside the
-current one. Click either side to focus it; the toolbar, search panels, page
+current one. Click either side to focus it; menu actions, search panels, page
 navigation, and status bar follow focus. The tab strip is shared: clicking a
 tab shows it in the focused pane, and closing a pane never closes its file.
 The split restores with the session; the divider width is remembered.
@@ -85,7 +85,10 @@ any launch files, so you can start typing immediately.
 
 The window remembers its last size, position, and maximized or full-screen mode
 across launches. Word wrap remembers your preference; toggle it from
-**View → Word Wrap**, the **Wrap** toolbar button, or **Mod+Shift+W**.
+**View → Word Wrap** or **Mod+Shift+W**. The native menu uses the system menu bar
+on macOS and the window menu bar on Windows/Linux. File tabs sit directly above
+the editor without a separate toolbar; the command palette is available from
+**View → Command Palette** or **Mod+Shift+P**.
 
 Click the indentation indicator to choose spaces or literal tabs for the current
 file, or to convert its leading indentation. Detection samples the first 64 KiB;

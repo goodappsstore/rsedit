@@ -64,18 +64,6 @@ let checkingExternal = false;
 const lockSlot = new Compartment();
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
-  <header class="toolbar">
-    <div class="brand">rs<span>edit</span></div>
-    <button data-action="new" title="New file">New</button>
-    <button data-action="open" title="Open files">Open</button>
-    <button data-action="open-folder" title="Open folder">Folder</button>
-    <button data-action="save" title="Save">Save</button>
-    <button data-action="find" title="Find and replace">Find</button>
-    <button data-action="split" title="Split editor right">Split</button>
-    <div class="spacer"></div>
-    <button data-action="palette" class="quiet" title="Command palette">Commands <small>${mod}⇧P</small></button>
-    <button data-action="wrap" title="Toggle word wrap" aria-pressed="${preferences.wrap}">Wrap</button>
-  </header>
   <div class="workbench">
     <aside class="folder-panel" aria-label="Folder files" hidden>
       <header class="folder-header"><span class="folder-title"></span><button data-action="refresh-folder" title="Refresh folder tree" aria-label="Refresh folder tree">↻</button><button data-action="close-folder" title="Close folder panel" aria-label="Close folder panel">×</button></header>
@@ -143,7 +131,6 @@ function storePreferences(): void {
   applyTheme(theme);
   document.documentElement.style.setProperty('--font-size', `${preferences.fontSize}px`);
   try { localStorage.setItem('rsedit.preferences', JSON.stringify(preferences)); } catch { /* Storage may be disabled. */ }
-  element('[data-action=wrap]').setAttribute('aria-pressed', String(preferences.wrap));
   if (desktop) void safely(() => call('set_word_wrap_menu', { enabled: preferences.wrap }));
 }
 function remember(path: string | null): void {
@@ -1467,7 +1454,7 @@ overlay.addEventListener('keydown', event => {
   const index = focusable.indexOf(document.activeElement as HTMLElement);
   event.preventDefault(); focusable[(index + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length]?.focus();
 });
-// App shortcuts also work while toolbar and search controls have focus.
+// App shortcuts also work while folder and search controls have focus.
 document.addEventListener('keydown', event => {
   if (event.defaultPrevented || !overlay.hidden || !(mac ? event.metaKey : event.ctrlKey)) return;
   const key = event.key.toLowerCase();

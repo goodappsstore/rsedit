@@ -405,8 +405,12 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .item(&item("save-as", "Save As…", "CmdOrCtrl+Shift+S")?)
         .separator()
         .item(&item("close", "Close File", "CmdOrCtrl+W")?)
-        .item(&item("reopen", "Reopen Closed File", "CmdOrCtrl+Shift+T")?)
-        .build()?;
+        .item(&item("reopen", "Reopen Closed File", "CmdOrCtrl+Shift+T")?);
+    #[cfg(not(target_os = "macos"))]
+    let file = file
+        .separator()
+        .item(&item("quit", "Quit rsedit", "CmdOrCtrl+Q")?);
+    let file = file.build()?;
     let edit = SubmenuBuilder::new(app, "Edit")
         .item(&item("undo", "Undo", "CmdOrCtrl+Z")?)
         .item(&item("redo", "Redo", "CmdOrCtrl+Shift+Z")?)
@@ -436,15 +440,23 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .text("move-to-other", "Move Current Tab to Other Pane")
         .text("close-split", "Close Split")
         .build()?;
-    let app_menu = SubmenuBuilder::new(app, "rsedit").about(None).separator();
+    let menu = MenuBuilder::new(app);
     #[cfg(target_os = "macos")]
-    let app_menu = app_menu.hide().hide_others().show_all().separator();
-    let app_menu = app_menu
-        .item(&item("quit", "Quit rsedit", "CmdOrCtrl+Q")?)
-        .build()?;
-    MenuBuilder::new(app)
-        .items(&[&app_menu, &file, &edit, &view])
-        .build()
+    let menu = menu.item(
+        &SubmenuBuilder::new(app, "rsedit")
+            .about(None)
+            .separator()
+            .hide()
+            .hide_others()
+            .show_all()
+            .separator()
+            .item(&item("quit", "Quit rsedit", "CmdOrCtrl+Q")?)
+            .build()?,
+    );
+    let menu = menu.items(&[&file, &edit, &view]);
+    #[cfg(not(target_os = "macos"))]
+    let menu = menu.item(&SubmenuBuilder::new(app, "Help").about(None).build()?);
+    menu.build()
 }
 
 pub fn run() {

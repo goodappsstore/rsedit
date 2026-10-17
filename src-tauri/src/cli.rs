@@ -88,7 +88,11 @@ pub fn requests(args: impl IntoIterator<Item = OsString>, cwd: &Path) -> Vec<Ope
     let mut literal = false;
     args.into_iter()
         .filter_map(|arg| {
-            if let Some(path) = arg.to_str().and_then(|s| s.strip_prefix(STDIN_ARG)) {
+            if let Some(path) = arg
+                .to_str()
+                .filter(|_| !literal)
+                .and_then(|s| s.strip_prefix(STDIN_ARG))
+            {
                 return Some(OpenRequest::Stdin {
                     path: path.to_owned(),
                 });
@@ -112,7 +116,11 @@ pub fn requests(args: impl IntoIterator<Item = OsString>, cwd: &Path) -> Vec<Ope
 /// Tauri and launch with a private argument that both startup and reuse consume.
 pub fn forward_stdin() -> Result<Option<i32>, String> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if !args.iter().any(|arg| arg == "-") {
+    if !args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "-")
+    {
         return Ok(None);
     }
     let mut input = tempfile::Builder::new()
@@ -126,15 +134,18 @@ pub fn forward_stdin() -> Result<Option<i32>, String> {
     let result = (|| {
         let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
         let mut used_stdin = false;
+        let mut literal = false;
         for arg in args {
-            if arg == "-" {
+            if arg == "--" {
+                literal = true;
+            }
+            if !literal && arg == "-" {
                 if used_stdin {
                     continue;
                 }
                 used_stdin = true;
                 let mut forwarded = OsString::from(STDIN_ARG);
                 forwarded.push(&path);
-                // Keep the private argument recognizable even after a user's --.
                 command.arg(forwarded);
             } else {
                 command.arg(arg);

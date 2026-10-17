@@ -78,9 +78,11 @@ export function createFolderPanel(
     for (const candidate of [...expanded]) if (matches(candidate)) expanded.delete(candidate);
     for (const candidate of [...dirs.keys()]) if (matches(candidate)) dirs.delete(candidate);
   }
-  function buildRows(host: HTMLElement, entries: FolderEntry[], depth: number): void {
+  function buildRows(host: HTMLElement, entries: FolderEntry[], depth: number, truncated: boolean, unsupportedNames: boolean): void {
     host.replaceChildren(...entries.map(entry => row(entry, depth)));
-    if (!entries.length) host.append(message('Empty folder', depth));
+    if (truncated) host.append(message(`Showing ${entries.length.toLocaleString()} entries; folder listing limit reached. Use quick-open to find other files.`, depth));
+    else if (!entries.length && !unsupportedNames) host.append(message('Empty folder', depth));
+    if (unsupportedNames) host.append(message('Some names are not UTF-8. Manage those entries in the system file manager.', depth));
     // Restore previously expanded folders after a refresh.
     for (const button of host.querySelectorAll<HTMLButtonElement>(':scope > .folder-node > .tree-row[data-dir]')) {
       if (button.dataset.dir && expanded.has(button.dataset.dir)) button.click();
@@ -96,6 +98,7 @@ export function createFolderPanel(
     button.setAttribute('role', 'treeitem');
     button.setAttribute('aria-level', String(depth + 1));
     button.dataset.name = entry.name;
+    button.dataset.symlink = String(entry.isSymlink);
     const marker = document.createElement('span'); marker.className = 'tree-marker'; marker.setAttribute('aria-hidden', 'true');
     marker.textContent = entry.isDirectory ? '▸' : '·';
     const name = document.createElement('span'); name.className = 'tree-name'; name.textContent = entry.name;
@@ -122,7 +125,7 @@ export function createFolderPanel(
       try {
         const listing = await call<FolderListing>('read_directory', { path: entry.path });
         if (pendingGeneration !== generation || !node.isConnected) return;
-        buildRows(children, listing.entries, depth + 1);
+        buildRows(children, listing.entries, depth + 1, listing.truncated, listing.unsupportedNames);
         loaded = true;
       } catch (error) {
         if (pendingGeneration !== generation || !node.isConnected) return;
@@ -167,7 +170,7 @@ export function createFolderPanel(
       dirs.clear();
       title.textContent = listing.name; title.title = listing.path;
       tree.setAttribute('aria-label', listing.path);
-      buildRows(tree, listing.entries, 0);
+      buildRows(tree, listing.entries, 0, listing.truncated, listing.unsupportedNames);
       show(visible);
     });
     return pendingRoot;
@@ -343,7 +346,9 @@ export function createFolderPanel(
   }
   async function deleteEntry(entry: FolderEntry): Promise<void> {
     if (!desktop) throw new Error('Managing files requires the desktop app.');
-    const confirmed = await hooks.confirmDelete(entry.isDirectory
+    const confirmed = await hooks.confirmDelete(entry.isSymlink
+      ? `Permanently delete the link ${entry.name}? Its target will be kept. This cannot be undone.`
+      : entry.isDirectory
       ? `Permanently delete ${entry.name} and everything inside it? This cannot be undone.`
       : `Permanently delete ${entry.name}? This cannot be undone.`);
     if (!confirmed) return;
@@ -396,7 +401,7 @@ export function createFolderPanel(
     const path = button.dataset.file ?? button.dataset.dir;
     const name = button.dataset.name;
     if (!path || !name) return undefined;
-    return { name, path, isDirectory: button.dataset.dir !== undefined };
+    return { name, path, isDirectory: button.dataset.dir !== undefined, isSymlink: button.dataset.symlink === 'true' };
   }
   function menuForEntry(entry: FolderEntry, x: number, y: number): void {
     if (entry.isDirectory) {

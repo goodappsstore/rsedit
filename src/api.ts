@@ -17,8 +17,8 @@ export type OpenRequest =
   | { kind: 'folder'; path: string }
   | { kind: 'stdin'; path: string }
   | { kind: 'error'; message: string };
-export interface FolderEntry { name: string; path: string; isDirectory: boolean }
-export interface FolderListing { name: string; path: string; entries: FolderEntry[] }
+export interface FolderEntry { name: string; path: string; isDirectory: boolean; isSymlink: boolean }
+export interface FolderListing { name: string; path: string; entries: FolderEntry[]; truncated: boolean; unsupportedNames: boolean }
 export interface FolderView { path: string; visible: boolean }
 export interface SearchScan {
   count: number; nextOffset: number | null; previousOffset: number | null;

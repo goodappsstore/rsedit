@@ -1,5 +1,5 @@
 import './style.css';
-import { EditorSelection, EditorState, StateEffect } from '@codemirror/state';
+import { ChangeSet, EditorSelection, EditorState, StateEffect } from '@codemirror/state';
 import type { Text } from '@codemirror/state';
 import { EditorView, keymap, panels, placeholder } from '@codemirror/view';
 import type { ViewUpdate } from '@codemirror/view';
@@ -19,6 +19,7 @@ interface Tab {
   pageStart: number;
   pageEnd: number;
   syncedDoc: Text;
+  changes?: ChangeSet;
   savedDoc?: Text;
   pending: boolean;
   busy: boolean;
@@ -83,7 +84,7 @@ app.innerHTML = `
     </div>
     <div class="split-row"></div>
     <section class="large-search" aria-label="Search entire large file" hidden>
-      <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
+      <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="large-match-count match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
       <div class="search-row"><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with (literal text)" /><button data-search="replace-all">Replace all in entire file</button></div>
       <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: close search. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
       
@@ -231,6 +232,7 @@ function showInPane(tab: Tab, pane: Pane): void {
 }
 function focusPane(pane: Pane, focusEditor = true): void {
   if (!panes.includes(pane)) return;
+  if (active !== pane.tab) hideLargeSearch();
   focusedPane = pane;
   view = pane.view;
   active = pane.tab;
@@ -380,11 +382,13 @@ function changed(update: ViewUpdate): void {
       origin.selection = origin.selection.map(update.changes);
       origin.byteOffset = tab.pageStart + new TextEncoder().encode(update.state.sliceDoc(0, origin.selection.main.head)).length;
     }
+    tab.changes = (tab.changes ?? ChangeSet.empty(update.startState.doc.length)).compose(update.changes);
     tab.pending = !update.state.doc.eq(tab.syncedDoc);
+    if (!tab.pending) tab.changes = undefined;
     if (sessionReady && !checkpointPromise) element('.recovery').textContent = 'Recovery pending';
     if (tab === largeFind?.tab) cancelSearch();
-    if (tab === active) element('.match-count').textContent = 'Search changed; press Enter to search again.';
-    renderTabs();
+    if (tab === active) element('.large-match-count').textContent = 'Search changed; press Enter to search again.';
+    updateDirtyMark(tab);
   }
   if ((update.selectionSet || update.docChanged) && tab === active) renderStatus();
 }
@@ -428,7 +432,8 @@ function installPage(tab: Tab, page: Page): void {
   tab.state = makeState(page, options(tab));
   tab.state = tab.state.update({ effects: StateEffect.appendConfig.of(lockSlot.of(lockExtension(tab.busy))) }).state;
   tab.syncedDoc = tab.state.doc;
-  if (!page.info.dirty) tab.savedDoc = tab.state.doc;
+  tab.changes = undefined;
+  tab.savedDoc = !page.info.dirty && !page.info.paged ? tab.state.doc : undefined;
   tab.pending = false;
   tab.loaded = true;
   tab.scrollTop = tab.scrollLeft = 0;
@@ -447,7 +452,8 @@ async function addPage(page: Page): Promise<void> {
   if (!tab.info.path) tab.info.name = `Untitled ${++nextUntitled}`;
   tab.state = tab.state.update({ effects: StateEffect.appendConfig.of(lockSlot.of(lockExtension(false))) }).state;
   tab.syncedDoc = tab.state.doc;
-  if (!page.info.dirty) tab.savedDoc = tab.state.doc;
+  tab.changes = undefined;
+  tab.savedDoc = !page.info.dirty && !page.info.paged ? tab.state.doc : undefined;
   applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(tab.tabSize)]));
   tabs.push(tab);
   activate(tab);
@@ -584,12 +590,22 @@ async function loadLanguage(tab: Tab, languageName?: string): Promise<void> {
   }
 }
 let lastTitle = '';
+function updateDirtyMark(tab: Tab): void {
+  const dot = tabbar.querySelector<HTMLElement>(`[data-tab="${tab.info.id}"] .dirty-mark`);
+  if (dot) {
+    const unsaved = dirty(tab);
+    dot.textContent = unsaved ? '●' : '';
+    dot.setAttribute('aria-label', unsaved ? 'Unsaved changes' : 'Saved');
+  }
+  if (tab === active) updateTitle();
+}
 function renderTabs(): void {
   folders.select(active?.info.path ?? null);
   tabbar.replaceChildren(...tabs.map(tab => {
     const node = document.createElement('button');
     const shown = paneOfTab(tab);
     node.className = `tab${tab === active ? ' active' : ''}${shown && tab !== active ? ' secondary' : ''}`;
+    node.dataset.tab = String(tab.info.id);
     node.setAttribute('role', 'tab');
     node.setAttribute('aria-selected', String(tab === active));
     node.tabIndex = tab === active ? 0 : -1;
@@ -705,28 +721,64 @@ function enqueueLaunchRequests(requests: OpenRequest[]): Promise<void> {
   });
   return launchQueue;
 }
+// Shared CodeMirror text nodes retain their UTF-8 lengths across edits. Count
+// leaf strings separately so offset conversion never copies a whole buffer.
+const utf8Lengths = new WeakMap<Text, number>();
+const utf8Encoder = new TextEncoder();
+function utf8Length(doc: Text, crlf: boolean): number {
+  let bytes = utf8Lengths.get(doc);
+  if (bytes === undefined) {
+    if (doc.children) {
+      bytes = doc.children.reduce((sum, child) => sum + utf8Length(child, false), doc.children.length - 1);
+    } else {
+      bytes = 0;
+      const cursor = doc.iter();
+      while (!cursor.next().done) bytes += cursor.lineBreak ? 1 : utf8Encoder.encode(cursor.value).length;
+    }
+    utf8Lengths.set(doc, bytes);
+  }
+  return bytes + (crlf ? doc.lines - 1 : 0);
+}
 async function flush(tab: Tab, force = false): Promise<void> {
   if (!tab.pending && !force) return;
-  const text = tab.state.sliceDoc();
-  const prior = tab.syncedDoc.sliceString(0, tab.syncedDoc.length, tab.info.eol === 'CRLF' ? '\r\n' : '\n');
+  const prior = tab.syncedDoc;
+  const current = tab.state.doc;
+  const crlf = tab.info.eol === 'CRLF';
   let from = 0;
   let beforeEnd = prior.length;
-  let afterEnd = text.length;
+  let afterEnd = current.length;
   if (!force) {
-    while (from < beforeEnd && from < afterEnd && prior[from] === text[from]) from++;
-    // Do not split a surrogate pair or the separator used by the document.
-    if (from && (/[\uDC00-\uDFFF]/.test(text[from] ?? '') || (text[from - 1] === '\r' && text[from] === '\n'))) from--;
-    while (beforeEnd > from && afterEnd > from && prior[beforeEnd - 1] === text[afterEnd - 1]) { beforeEnd--; afterEnd--; }
-    if (afterEnd < text.length && (/[\uDC00-\uDFFF]/.test(text[afterEnd]) || (text[afterEnd - 1] === '\r' && text[afterEnd] === '\n'))) { beforeEnd++; afterEnd++; }
+    if (!tab.changes || tab.changes.empty) return;
+    from = prior.length;
+    beforeEnd = afterEnd = 0;
+    tab.changes.iterChangedRanges((fromA, toA, _fromB, toB) => {
+      from = Math.min(from, fromA);
+      beforeEnd = Math.max(beforeEnd, toA);
+      afterEnd = Math.max(afterEnd, toB);
+    });
+    // ChangeSets use UTF-16 positions. Keep complete Unicode scalars at edges.
+    if (from && /[\uDC00-\uDFFF]/.test(prior.sliceString(from, from + 1) + current.sliceString(from, from + 1))) from--;
+    if (/[\uDC00-\uDFFF]/.test(prior.sliceString(beforeEnd, beforeEnd + 1) + current.sliceString(afterEnd, afterEnd + 1))) { beforeEnd++; afterEnd++; }
   }
-  const encoder = new TextEncoder();
-  const start = tab.pageStart + encoder.encode(prior.slice(0, from)).length;
-  const end = tab.pageStart + encoder.encode(prior.slice(0, beforeEnd)).length;
-  const info = await call<Info>('replace_range', { id: tab.info.id, start, end, text: text.slice(from, afterEnd), revision: tab.info.revision, markClean: !tab.info.paged && !!tab.savedDoc && tab.state.doc.eq(tab.savedDoc) });
+  utf8Lengths.set(prior, tab.pageEnd - tab.pageStart - (crlf ? prior.lines - 1 : 0));
+  const start = tab.pageStart + (from <= prior.length / 2
+    ? utf8Length(prior.slice(0, from), crlf)
+    : tab.pageEnd - tab.pageStart - utf8Length(prior.slice(from), crlf));
+  const end = start + utf8Length(prior.slice(from, beforeEnd), crlf);
+  const text = tab.state.sliceDoc(from, afterEnd);
+  const wasPaged = tab.info.paged;
+  const priorSize = tab.info.size;
+  const info = await call<Info>('replace_range', { id: tab.info.id, start, end, text, revision: tab.info.revision, markClean: !wasPaged && !!tab.savedDoc && current.eq(tab.savedDoc) });
   tab.info = { ...info, name: info.path ? info.name : tab.info.name };
-  tab.pageEnd = tab.pageStart + new TextEncoder().encode(text).length;
-  tab.syncedDoc = tab.state.doc;
+  tab.pageEnd += info.size - priorSize;
+  tab.syncedDoc = current;
+  tab.changes = undefined;
   tab.pending = false;
+  if (!wasPaged && info.paged) {
+    const offset = utf8Length(current.slice(0, tab.state.selection.main.head), crlf);
+    installPage(tab, await call<Page>('read_page', { id: info.id, offset: Math.max(0, offset - 1024) }));
+    notify('This buffer now uses bounded views. Edits save the entire file; undo spans views.');
+  }
 }
 async function saveTab(tab: Tab | undefined, saveAs = false): Promise<boolean> {
   if (!tab) return false;
@@ -744,7 +796,7 @@ async function saveTab(tab: Tab | undefined, saveAs = false): Promise<boolean> {
     notify(`Saving the entire ${tab.info.name} (${formatBytes(tab.info.size)})…`);
     await flush(tab, saveAs && !tab.info.paged);
     tab.info = await call<Info>('save_document', { id: tab.info.id, path });
-    tab.savedDoc = tab.state.doc;
+    tab.savedDoc = tab.info.paged ? undefined : tab.state.doc;
     remember(tab.info.path);
     void loadLanguage(tab);
     if (active === tab) notify(`Saved ${tab.info.name}.`);
@@ -954,7 +1006,7 @@ function showLargeSearch(): void {
   if (searchPanelOpen(view.state)) closeSearchPanel(view);
   if (largeSearch.hidden) {
     largeOrigin = captureOrigin();
-    element('.match-count').textContent = '0 matches';
+    element('.large-match-count').textContent = '0 matches';
   }
   largeSearch.hidden = false; queryInput.focus(); queryInput.select();
 }
@@ -987,7 +1039,7 @@ function renderMatchCount(session: LargeFind): void {
       ordinal += count;
     }
   }
-  element('.match-count').textContent = `${ordinal === undefined ? '' : `${ordinal} of `}${session.total.toLocaleString()}${session.complete ? '' : '+'} matches`;
+  element('.large-match-count').textContent = `${ordinal === undefined ? '' : `${ordinal} of `}${session.total.toLocaleString()}${session.complete ? '' : '+'} matches`;
 }
 async function scanMatches(session: LargeFind, start: number, anchor: number): Promise<SearchScan | undefined> {
   const result = await call<SearchScan>('scan_search', { id: session.tab.info.id, query: session.query, start, anchor });
@@ -1010,6 +1062,8 @@ async function showMatch(session: LargeFind, offset: number): Promise<void> {
   const bytesLength = new TextEncoder().encode(session.query).length;
   const inputFocused = document.activeElement === queryInput;
   await locked(tab, async () => {
+    if (!validSearch(session)) return;
+    await flush(tab);
     if (!validSearch(session)) return;
     if (offset < tab.pageStart || offset + bytesLength > tab.pageEnd) {
       const page = await call<Page>('read_page', { id: tab.info.id, offset: Math.max(0, offset - 1024) });
@@ -1068,7 +1122,7 @@ async function searchLarge(direction = 1): Promise<void> {
   if (generation !== searchGeneration || active !== tab || largeSearch.hidden) return;
   const session: LargeFind = { tab, query, generation, revision: tab.info.revision, counts: new Map(), total: 0, complete: false, busy: false, offset: null, chunk: 0, index: 0 };
   largeFind = session;
-  element('.match-count').textContent = 'Searching…';
+  element('.large-match-count').textContent = 'Searching…';
   void safely(() => countMatches(session));
   await navigateMatch(session, direction);
 }
@@ -1421,7 +1475,7 @@ queryInput.addEventListener('keydown', event => {
   if (event.key === 'Enter') { event.preventDefault(); void safely(() => searchLarge(event.shiftKey ? -1 : 1)); }
 });
 queryInput.addEventListener('input', () => {
-  cancelSearch(); if (active) applyEffect(active, currentMatch.of(null)); element('.match-count').textContent = queryInput.value ? 'Searching…' : '0 matches';
+  cancelSearch(); if (active) applyEffect(active, currentMatch.of(null)); element('.large-match-count').textContent = queryInput.value ? 'Searching…' : '0 matches';
   if (queryInput.value) searchTimer = setTimeout(() => void safely(() => searchLarge()), 150);
 });
 document.addEventListener('keydown', event => {
@@ -1457,7 +1511,7 @@ overlay.addEventListener('keydown', event => {
 // App shortcuts also work while folder and search controls have focus.
 document.addEventListener('keydown', event => {
   if (event.defaultPrevented || !overlay.hidden || !(mac ? event.metaKey : event.ctrlKey)) return;
-  const key = event.key.toLowerCase();
+  const key = event.altKey && event.code === 'KeyO' ? 'o' : event.key.toLowerCase();
   if (event.shiftKey && !event.altKey) {
     // Shifted square brackets may arrive as braces, depending on the keyboard layout.
     const direction = key === '[' || key === '{' || event.code === 'BracketLeft' ? -1
@@ -1465,7 +1519,7 @@ document.addEventListener('keydown', event => {
     if (direction) { event.preventDefault(); cycleTab(direction); return; }
   }
   const action = key === 'o' ? (event.altKey ? folders.open : openFiles) : key === 'n' ? newTab : key === 's' ? async () => { await saveTab(active, event.shiftKey); }
-    : key === 't' && event.shiftKey ? reopenClosedTab : key === 'w' ? () => closeTab(active) : key === 'p' ? (event.shiftKey ? showCommands : showFiles) : undefined;
+    : key === 't' && event.shiftKey ? reopenClosedTab : key === 'w' ? (event.shiftKey ? toggleWrap : () => closeTab(active)) : key === 'p' ? (event.shiftKey ? showCommands : showFiles) : undefined;
   if (action) { event.preventDefault(); void safely(action); }
 });
 tabbar.addEventListener('keydown', event => {
@@ -1552,6 +1606,7 @@ async function initializeDesktop(): Promise<void> {
   });
   await nativeWindow.onCloseRequested(async event => {
     event.preventDefault();
+    if (shuttingDown) return;
     await safely(async () => {
       shuttingDown = true;
       cancelSearch();
@@ -1567,9 +1622,15 @@ async function initializeDesktop(): Promise<void> {
         lockedTabs = [...tabs, ...closedTabs];
         for (const tab of lockedTabs) { tab.busy = true; applyEffect(tab, lockSlot.reconfigure(lockExtension(true))); }
         notify('Preserving session…');
-        await persistBuffers(lockedTabs, true);
-        // Capture the final state while the native window still exists.
-        await call('persist_window_state');
+        try {
+          await persistBuffers(lockedTabs, true);
+        } catch (error) {
+          const { confirm } = await import('@tauri-apps/plugin-dialog');
+          if (!await confirm(`Could not preserve this session: ${String(error)}\n\nQuit anyway? Edits since the last successful checkpoint will not be recovered. Save affected buffers before quitting to keep them.`, { title: 'Recovery failed', kind: 'warning', okLabel: 'Quit without recovery', cancelLabel: 'Keep editing' })) return;
+        }
+        // Window preferences must not trap a session whose buffers are safe.
+        try { await call('persist_window_state'); }
+        catch (error) { console.error('Could not preserve window preferences', error); }
         await nativeWindow.destroy();
       } catch (error) {
         throw new Error(`Could not finish preserving and closing the session. The editor remains open: ${String(error)}`);
@@ -1616,7 +1677,10 @@ async function initializeDesktop(): Promise<void> {
       }
     }
     if (restored.errors.length) notify(restored.errors.join('\n'), true);
-  } catch (error) { notify(`Could not restore the previous session: ${String(error)}`, true); }
+  } catch (error) {
+    element('.recovery').textContent = 'Recovery unavailable';
+    notify(`Could not restore the previous session: ${String(error)}. Save buffers to files before quitting.`, true);
+  }
   if (!tabs.length) await newTab();
   const requests = await call<OpenRequest[]>('startup_paths');
   for (const request of requests) await safely(() => openRequest(request));

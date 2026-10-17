@@ -62,7 +62,10 @@ all platforms listed above.
 
 Open files through the dialog, drag them into the window, or pass paths to the
 executable. CLI launches reuse and focus the running window. macOS Open With is supported. Use **File → Open Folder…** to browse
-a folder; entries load on expansion and refresh manually. **Mod+P** fuzzy-matches
+a folder; entries load on expansion and refresh manually. Each listing examines
+at most 2,000 entries and reports when that limit is reached. Names that cannot
+be represented as UTF-8 are omitted with a notice; manage them in the system file
+manager. **Mod+P** fuzzy-matches
 open tabs and relative paths beneath that folder. Folder search runs only when
 requested, with no persistent index. Each request returns at most 80 results
 and stops after 50,000 entries or one second; the palette reports partial results
@@ -122,7 +125,8 @@ the view's displayed line numbers remain relative to that view.
 The resulting untitled tab participates in session recovery and uses Save As;
 the redirected source is never overwritten. Repeated `-` arguments open that
 input once. For a file literally named `-`, use `./-`. Invalid paths and unsupported
-text are reported in the editor. Use `--` before paths beginning with a dash.
+text are reported in the editor. Use `--` before paths beginning with a dash;
+`-- -` opens a literal file named `-`.
 
 ## Keyboard shortcuts
 
@@ -244,16 +248,25 @@ history read from the completed private recovery copies, so later external
 overwrites cannot invalidate those bytes.
 Unchanged buffers reuse their last snapshot. The manifest is replaced only after
 all new recovery data is synced; an interrupted checkpoint leaves the previous
-manifest usable. A corrupt/unreadable manifest and failed recovery buffers are
-preserved. If a tab cannot be checkpointed and has a previous snapshot, that
-snapshot is retained while other tabs are checkpointed. Without a previous
+manifest usable. A corrupt, unreadable, or unsupported manifest and its buffer
+generations are moved to a `preserved-*` subdirectory before starting a fresh
+session. Interrupted archives finish on the next launch. Manifests are limited to
+16 MiB. Individual failed recovery buffers retain their existing references.
+If a tab cannot be checkpointed and has a previous snapshot, that snapshot is
+retained while other tabs are checkpointed. Without a previous
 snapshot, the existing manifest is preserved. Errors identify affected
-files and warn that newer edits are not saved. The window stays open if its
-final checkpoint fails. Recovery copies can take seconds and require disk space, especially after a whole-file operation.
+files and warn that newer edits are not saved. If the final checkpoint fails,
+the app offers Keep editing or an explicit Quit without recovery choice.
+Recovery copies can take seconds and require disk space, especially after a
+whole-file operation.
 
-rsedit supports UTF-8 text, including a BOM and LF/CRLF. Binary and UTF-16 files
-are rejected; huge files are validated view by view. New editor line breaks use
-the detected separator; unchanged source bytes keep their original separators.
+rsedit supports UTF-8 text, including a BOM and LF/CRLF. Opening checks the first
+1 MiB for NUL bytes and UTF-16 BOMs. Fully loaded files and every huge-file view
+reject NUL bytes and invalid UTF-8; unseen bytes in huge files are checked when
+viewed. New editor line breaks use the detected separator; unchanged source
+bytes keep their original separators. The first observed newline determines LF
+or CRLF; edits use LF if none has been observed. With CRLF selected, lone LF bytes
+remain literal content in that line across navigation and editing.
 
 Saves guard against external changes using size and modification time, preserve
 basic permissions, and replace the destination through a synced temporary file.
@@ -262,8 +275,9 @@ silently read changed old source bytes after Save As. These checks can miss chan
 that preserve metadata. On regaining focus, rsedit checks open files, reloads clean buffers, and offers edited buffers choices
 to keep edits, Save As, copy the visible text to a new recovery tab, or reload
 with a discard prompt. Repeated notices for the same disk version are suppressed.
-There is no live watcher or power-loss recovery guarantee. Symlinks resolve to
-their target; hard links, extended metadata, and ACLs may not survive replacement.
+There is no live watcher or power-loss recovery guarantee. Opening and saving
+symlinks resolve to their target; folder rename/delete actions operate on the
+link itself. Hard links, extended metadata, and ACLs may not survive replacement.
 
 If an original disk-backed huge-file source changes externally before its first
 successful recovery copy, rsedit cannot safely reconstruct unseen old bytes. Use **Copy visible text to a new recovery
@@ -307,7 +321,7 @@ Report bugs or suggest focused improvements through
 [GitHub Issues](https://github.com/goodappsstore/rsedit/issues). Include your OS,
 app version, steps to reproduce, and any relevant error message.
 
-For code changes, read [AGENTS.md](AGENTS.md), keep the editor small, and run:
+For code changes, keep the editor small and run:
 
 ```sh
 npm run check

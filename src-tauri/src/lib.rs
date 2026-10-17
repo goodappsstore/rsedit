@@ -3,7 +3,7 @@ mod document;
 mod folder;
 mod session;
 use cli::OpenRequest;
-use document::{Document, Info, Page, SearchResult, SearchScan};
+use document::{Document, Info, Page, SearchScan};
 use session::{RestoredSession, SessionStore, SessionView};
 use std::time::Instant;
 use std::{
@@ -71,7 +71,7 @@ async fn work<T: Send + 'static>(
 }
 #[tauri::command]
 fn new_document(editor: State<'_, Editor>) -> Result<Page, String> {
-    let doc = Document::empty(editor.id());
+    let mut doc = Document::empty(editor.id());
     let page = doc.page(0)?;
     editor.insert(doc)?;
     Ok(page)
@@ -80,7 +80,7 @@ fn new_document(editor: State<'_, Editor>) -> Result<Page, String> {
 async fn open_document(editor: State<'_, Editor>, path: String) -> Result<Page, String> {
     let id = editor.id();
     let (doc, page) = tauri::async_runtime::spawn_blocking(move || {
-        let doc = Document::open(id, &PathBuf::from(path))?;
+        let mut doc = Document::open(id, &PathBuf::from(path))?;
         let page = doc.page(0)?;
         Ok::<_, String>((doc, page))
     })
@@ -93,7 +93,7 @@ async fn open_document(editor: State<'_, Editor>, path: String) -> Result<Page, 
 async fn open_stdin(editor: State<'_, Editor>, path: String) -> Result<Page, String> {
     let id = editor.id();
     let (doc, page) = tauri::async_runtime::spawn_blocking(move || {
-        let doc = Document::from_stdin(id, &PathBuf::from(path))?;
+        let mut doc = Document::from_stdin(id, &PathBuf::from(path))?;
         let page = doc.page(0)?;
         Ok::<_, String>((doc, page))
     })
@@ -271,15 +271,6 @@ async fn save_document(
         doc.save(path.map(PathBuf::from))
     })
     .await
-}
-#[tauri::command]
-async fn search_document(
-    editor: State<'_, Editor>,
-    id: u64,
-    query: String,
-    start: u64,
-) -> Result<SearchResult, String> {
-    work(editor.get(id)?, move |doc| doc.search(&query, start)).await
 }
 #[tauri::command]
 async fn scan_search(
@@ -527,7 +518,6 @@ pub fn run() {
             delete_path,
             reveal_in_file_manager,
             retarget_document,
-            search_document,
             scan_search,
             close_document,
             startup_paths,

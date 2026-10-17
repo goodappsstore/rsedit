@@ -250,14 +250,6 @@ pub struct Page {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SearchResult {
-    pub offsets: Vec<u64>,
-    pub scanned_through: u64,
-    pub complete: bool,
-    pub revision: u64,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SearchScan {
     pub count: u64,
     pub next_offset: Option<u64>,
@@ -268,6 +260,23 @@ pub struct SearchScan {
     pub complete: bool,
     pub revision: u64,
 }
+fn reject_binary(bytes: &[u8]) -> Result<(), String> {
+    if bytes.contains(&0) {
+        return Err(
+            "This looks like a binary or UTF-16 file. rsedit currently supports UTF-8 text.".into(),
+        );
+    }
+    Ok(())
+}
+
+fn detected_eol(bytes: &[u8]) -> &'static str {
+    match memchr::memchr(b'\n', bytes) {
+        Some(index) if index > 0 && bytes[index - 1] == b'\r' => "CRLF",
+        Some(_) => "LF",
+        None => "Unknown",
+    }
+}
+
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -373,9 +382,12 @@ impl Document {
         if metadata.len() > 9_007_199_254_740_991 {
             return Err("This file exceeds the supported offset range.".into());
         }
-        let mut sample = vec![0; metadata.len().min(8192) as usize];
+        let mut sample = vec![0; metadata.len().min(IO_SIZE) as usize];
         read_exact_at(&file, &mut sample, 0)?;
-        if sample.contains(&0) {
+        if sample.contains(&0)
+            || sample.starts_with(&[0xff, 0xfe])
+            || sample.starts_with(&[0xfe, 0xff])
+        {
             return Err(
                 "This looks like a binary or UTF-16 file. rsedit currently supports UTF-8 text."
                     .into(),
@@ -408,16 +420,14 @@ impl Document {
             version: 0,
             saved_version: if unsaved { None } else { Some(0) },
             bom,
-            eol: if sample.windows(2).any(|b| b == b"\r\n") {
-                "CRLF"
-            } else {
-                "LF"
-            },
+            eol: detected_eol(&sample),
         };
         if !doc.paged && validate_small {
             let bytes = doc.read_range(0, size)?;
+            reject_binary(&bytes)?;
             std::str::from_utf8(&bytes)
                 .map_err(|_| "This file is not valid UTF-8 text.".to_string())?;
+            doc.eol = detected_eol(&bytes);
             doc.paged = bytes
                 .split(|b| *b == b'\n')
                 .any(|line| line.len() > 1024 * 1024);
@@ -448,7 +458,7 @@ impl Document {
             dirty: self.dirty,
             paged: self.paged,
             bom: self.bom,
-            eol: self.eol,
+            eol: if self.eol == "CRLF" { "CRLF" } else { "LF" },
         }
     }
     fn check_source(&self) -> Result<(), String> {
@@ -591,7 +601,7 @@ impl Document {
         }
         Ok(output)
     }
-    pub fn page(&self, offset: u64) -> Result<Page, String> {
+    pub fn page(&mut self, offset: u64) -> Result<Page, String> {
         self.check_source()?;
         let mut start = if self.paged { offset.min(self.size) } else { 0 };
         // A requested byte can be in the middle of a UTF-8 scalar or CRLF.
@@ -607,6 +617,10 @@ impl Document {
         }
         let limit = if self.paged { PAGE_SIZE } else { self.size };
         let mut bytes = self.read_range(start, (self.size - start).min(limit))?;
+        reject_binary(&bytes)?;
+        if self.eol == "Unknown" {
+            self.eol = detected_eol(&bytes);
+        }
         if start + (bytes.len() as u64) < self.size {
             // Back up at most 3 bytes for the last, incomplete scalar.
             match std::str::from_utf8(&bytes) {
@@ -618,7 +632,15 @@ impl Document {
                 bytes.pop();
             }
             // Prefer a complete line, without scanning/allocating an unbounded line.
-            if let Some(last_newline) = memchr::memrchr(b'\n', &bytes) {
+            if let Some(last_newline) = bytes
+                .iter()
+                .enumerate()
+                .rfind(|(index, byte)| {
+                    **byte == b'\n'
+                        && (self.eol != "CRLF" || (*index > 0 && bytes[*index - 1] == b'\r'))
+                })
+                .map(|(index, _)| index)
+            {
                 if bytes.len() - last_newline < 4096 {
                     bytes.truncate(last_newline + 1);
                 }
@@ -648,7 +670,7 @@ impl Document {
     }
     /// Resolve a whole-document, one-based location with bounded memory. Columns
     /// use UTF-16 units, matching CodeMirror; never stop inside a UTF-8 scalar.
-    pub fn location_offset(&self, line: u64, col: u64) -> Result<u64, String> {
+    pub fn location_offset(&mut self, line: u64, col: u64) -> Result<u64, String> {
         if line == 0 || col == 0 {
             return Err("Line and column must be positive.".into());
         }
@@ -660,7 +682,10 @@ impl Document {
         while cursor < self.size && current_line < line {
             let bytes = self.read_range(cursor, (self.size - cursor).min(IO_SIZE))?;
             for (index, &byte) in bytes.iter().enumerate() {
-                if byte == b'\n' && (self.eol == "LF" || previous_cr) {
+                if byte == b'\n' && self.eol == "Unknown" {
+                    self.eol = if previous_cr { "CRLF" } else { "LF" };
+                }
+                if byte == b'\n' && (self.eol != "CRLF" || previous_cr) {
                     current_line += 1;
                     line_start = cursor + index as u64 + 1;
                     if current_line == line {
@@ -673,7 +698,6 @@ impl Document {
         }
         cursor = line_start;
         let mut remaining = col - 1;
-        let separator = if self.eol == "CRLF" { "\r\n" } else { "\n" };
         while cursor < self.size && remaining > 0 {
             let mut bytes = self.read_range(cursor, (self.size - cursor).min(IO_SIZE))?;
             if cursor + (bytes.len() as u64) < self.size {
@@ -683,11 +707,15 @@ impl Document {
                     }
                     bytes.truncate(error.valid_up_to());
                 }
-                if self.eol == "CRLF" && bytes.last() == Some(&b'\r') {
+                if self.eol != "LF" && bytes.last() == Some(&b'\r') {
                     bytes.pop();
                 }
             }
             let text = std::str::from_utf8(&bytes).map_err(err)?;
+            if self.eol == "Unknown" {
+                self.eol = detected_eol(&bytes);
+            }
+            let separator = if self.eol == "CRLF" { "\r\n" } else { "\n" };
             let end = text.find(separator).unwrap_or(text.len());
             for (index, character) in text[..end].char_indices() {
                 let width = character.len_utf16() as u64;
@@ -719,9 +747,7 @@ impl Document {
         if revision != self.revision {
             return Err("The document changed before this edit could be applied.".into());
         }
-        if start != 0 || end != self.size {
-            self.check_source()?;
-        }
+        self.check_source()?;
         if start > end || end > self.size {
             return Err("Invalid edit range.".into());
         }
@@ -733,8 +759,16 @@ impl Document {
                 return Err("An edit cannot split a UTF-8 character.".into());
             }
         }
-        self.remember_edit(start);
         let replacement_len = text.len() as u64;
+        if self.eol == "Unknown" {
+            // The view used LF while no separator was known. Keep that contract
+            // when committing edits, including pasted CRLF represented literally.
+            self.eol = "LF";
+        }
+        // Once promoted, retain backend history and bounded views across undo.
+        self.paged |= self.size - (end - start) + replacement_len > SMALL_LIMIT
+            || text.split('\n').any(|line| line.len() > IO_SIZE as usize);
+        self.remember_edit(start);
         let mut next = Vec::new();
         let mut logical = 0;
         let added = Piece {
@@ -909,7 +943,11 @@ impl Document {
                 dirty: saved.dirty,
                 paged: true,
                 bom: saved.bom,
-                eol: if saved.eol == "CRLF" { "CRLF" } else { "LF" },
+                eol: match saved.eol.as_str() {
+                    "CRLF" => "CRLF",
+                    "Unknown" => "Unknown",
+                    _ => "LF",
+                },
                 recovered: true,
                 undo: vec![],
                 redo: vec![],
@@ -949,7 +987,11 @@ impl Document {
             dirty: saved.dirty,
             paged: saved.paged || saved.size > SMALL_LIMIT,
             bom: saved.bom,
-            eol: if saved.eol == "CRLF" { "CRLF" } else { "LF" },
+            eol: match saved.eol.as_str() {
+                "CRLF" => "CRLF",
+                "Unknown" => "Unknown",
+                _ => "LF",
+            },
             recovered: true,
             undo: vec![],
             redo: vec![],
@@ -976,29 +1018,38 @@ impl Document {
         if self.path.as_ref() == Some(&target) {
             self.check_original()?;
         }
-        let target_stamp = if target.exists() {
-            Some(Stamp::read(&target)?)
-        } else {
-            None
+        let target_metadata = match fs::metadata(&target) {
+            Ok(meta) => Some(meta),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(err(error)),
         };
+        if target_metadata
+            .as_ref()
+            .is_some_and(|meta| meta.permissions().readonly())
+        {
+            return Err("The file is read-only. Use Save As to choose another path.".into());
+        }
+        let target_stamp = target_metadata
+            .as_ref()
+            .map(Stamp::from_metadata)
+            .transpose()?;
         let parent = target.parent().ok_or("Invalid save directory.")?;
         let mut temp = NamedTempFile::new_in(parent).map_err(err)?;
         self.write_content(temp.as_file_mut())?;
-        if let Ok(meta) = fs::metadata(&target) {
+        self.check_source()?;
+        if self.path.as_ref() == Some(&target) {
+            self.check_original()?;
+        }
+        let now = if target.exists() {
+            let meta = fs::metadata(&target).map_err(err)?;
             if meta.permissions().readonly() {
                 return Err("The file is read-only. Use Save As to choose another path.".into());
             }
             temp.as_file()
                 .set_permissions(meta.permissions())
                 .map_err(err)?;
-        }
-        temp.as_file().sync_all().map_err(err)?;
-        self.check_source()?;
-        if self.path.as_ref() == Some(&target) {
-            self.check_original()?;
-        }
-        let now = if target.exists() {
-            Some(Stamp::read(&target)?)
+            temp.as_file().sync_all().map_err(err)?;
+            Some(Stamp::from_metadata(&meta)?)
         } else {
             None
         };
@@ -1117,6 +1168,7 @@ impl Document {
         drop(writer);
         output.sync_all().map_err(err)?;
         self.check_source()?;
+        self.paged |= size > SMALL_LIMIT;
         self.remember_edit(0);
         self.pieces = vec![Piece {
             source: Source::disk(output)?,
@@ -1183,6 +1235,7 @@ impl Document {
         output.sync_all().map_err(err)?;
         self.check_source()?;
         if count > 0 {
+            self.paged |= size > SMALL_LIMIT;
             self.remember_edit(0);
             self.pieces = vec![Piece {
                 source: Source::disk(output)?,
@@ -1242,50 +1295,5 @@ impl Document {
         }
         self.check_source()?;
         Ok(result)
-    }
-    pub fn search(&self, query: &str, start: u64) -> Result<SearchResult, String> {
-        self.check_source()?;
-        if query.is_empty() || query.len() > 4096 {
-            return Err("Enter between 1 and 4096 bytes to search.".into());
-        }
-        let mut offsets = Vec::new();
-        let mut cursor = start.min(self.size);
-        let finder = memchr::memmem::Finder::new(query.as_bytes());
-        // Bounded requests allow navigation/cancellation between scan batches.
-        let scan_end = self.size.min(cursor.saturating_add(64 * 1024 * 1024));
-        while cursor < scan_end {
-            let bytes = self.read_range(
-                cursor,
-                (self.size - cursor).min(IO_SIZE + query.len() as u64),
-            )?;
-            let covered = IO_SIZE.min(scan_end - cursor);
-            let mut local = 0;
-            while let Some(found) = finder.find(&bytes[local..]) {
-                let position = local + found;
-                if position as u64 >= covered {
-                    break;
-                }
-                offsets.push(cursor + position as u64);
-                local = position + query.len();
-                if offsets.len() == 200 {
-                    let through = cursor + local as u64;
-                    self.check_source()?;
-                    return Ok(SearchResult {
-                        offsets,
-                        scanned_through: through,
-                        complete: through >= self.size,
-                        revision: self.revision,
-                    });
-                }
-            }
-            cursor += covered.max(local as u64);
-        }
-        self.check_source()?;
-        Ok(SearchResult {
-            offsets,
-            scanned_through: cursor,
-            complete: cursor >= self.size,
-            revision: self.revision,
-        })
     }
 }

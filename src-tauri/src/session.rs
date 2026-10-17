@@ -6,11 +6,13 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 use tempfile::{Builder, NamedTempFile};
+
+const MANIFEST_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,9 +79,16 @@ struct SavedSession {
     folder: Option<FolderView>,
 }
 #[derive(Default)]
+enum LoadState {
+    #[default]
+    Pending,
+    Ready,
+    Unavailable(String),
+}
+#[derive(Default)]
 struct StoreState {
     lock: Option<File>,
-    loaded: bool,
+    loaded: LoadState,
     unrestored_open: Vec<SavedTab>,
     unrestored_closed: Vec<SavedTab>,
     sources: SnapshotSources,
@@ -115,16 +124,93 @@ impl SessionStore {
         }
         Ok(())
     }
+    // Keep each failed session in its own directory, retaining relative paths.
+    // The marker lets startup finish an archive interrupted between renames.
+    fn finish_preservation(&self, archive: &Path) -> Result<(), String> {
+        let manifest = self.directory.join("session.json");
+        if manifest.try_exists().map_err(err)? {
+            fs::rename(&manifest, archive.join("session.json")).map_err(err)?;
+        }
+        for entry in fs::read_dir(&self.directory).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            if entry.file_name().to_string_lossy().starts_with("buffers-") {
+                fs::rename(entry.path(), archive.join(entry.file_name())).map_err(err)?;
+            }
+        }
+        fs::remove_file(archive.join("preserving")).map_err(err)
+    }
+    fn finish_pending_preservations(&self) -> Result<(), String> {
+        for entry in fs::read_dir(&self.directory).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("preserved-")
+                && entry.file_type().map_err(err)?.is_dir()
+                && entry.path().join("preserving").try_exists().map_err(err)?
+            {
+                self.finish_preservation(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+    fn preserve_previous(&self, reason: String) -> Result<RestoredSession, String> {
+        let archive = Builder::new()
+            .prefix("preserved-")
+            .tempdir_in(&self.directory)
+            .map_err(err)?;
+        File::create(archive.path().join("preserving"))
+            .map_err(err)?
+            .sync_all()
+            .map_err(err)?;
+        let archive = archive.keep();
+        self.finish_preservation(&archive).map_err(|error| {
+            format!(
+                "Could not archive the previous session: {error}. Its data remains in {} and {}.",
+                self.directory.display(),
+                archive.display()
+            )
+        })?;
+        Ok(RestoredSession {
+            errors: vec![format!("{reason} The previous manifest and buffers were preserved in {}. A fresh session has started.", archive.display())],
+            ..RestoredSession::default()
+        })
+    }
     pub fn restore(&self, editor: &Editor) -> Result<RestoredSession, String> {
         let mut state = self.state.lock().map_err(err)?;
-        self.acquire(&mut state)?;
-        if state.loaded {
+        if matches!(state.loaded, LoadState::Ready) {
             return Err("The session has already been restored.".into());
         }
+        let result = self.restore_locked(editor, &mut state);
+        state.loaded = match &result {
+            Ok(_) => LoadState::Ready,
+            Err(error) => LoadState::Unavailable(error.clone()),
+        };
+        result
+    }
+    fn restore_locked(
+        &self,
+        editor: &Editor,
+        state: &mut StoreState,
+    ) -> Result<RestoredSession, String> {
+        self.acquire(state)?;
+        self.finish_pending_preservations()?;
         let saved: SavedSession = match File::open(self.directory.join("session.json")) {
-            Ok(file) => serde_json::from_reader(file).map_err(|e| {
-                format!("Could not read the previous session. Its buffers have been preserved: {e}")
-            })?,
+            Ok(file) => {
+                if file.metadata().map_err(err)?.len() > MANIFEST_LIMIT {
+                    drop(file);
+                    return self
+                        .preserve_previous("The previous session manifest exceeds 16 MiB.".into());
+                }
+                match serde_json::from_reader(file.take(MANIFEST_LIMIT + 1)) {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        return self.preserve_previous(format!(
+                            "Could not read the previous session: {error}."
+                        ))
+                    }
+                }
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => SavedSession {
                 version: 2,
                 open: vec![],
@@ -133,12 +219,12 @@ impl SessionStore {
                 secondary_index: None,
                 folder: None,
             },
-            Err(e) => return Err(err(e)),
+            Err(e) => {
+                return self.preserve_previous(format!("Could not open the previous session: {e}."))
+            }
         };
         if ![1, 2].contains(&saved.version) {
-            return Err(
-                "Unrecognized session format. The previous session has been preserved.".into(),
-            );
+            return self.preserve_previous("Unrecognized session format.".into());
         }
         let mut restored = RestoredSession {
             folder: saved.folder,
@@ -192,7 +278,6 @@ impl SessionStore {
                 }
             }
         }
-        state.loaded = true;
         Ok(restored)
     }
     pub fn save(&self, editor: &Editor, view: SessionView) -> Result<(), String> {
@@ -213,8 +298,12 @@ impl SessionStore {
         }
         let mut state = self.state.lock().map_err(err)?;
         self.acquire(&mut state)?;
-        if !state.loaded {
-            return Err("The previous session was not restored. Quit was cancelled to protect its saved buffers.".into());
+        match &state.loaded {
+            LoadState::Ready => (),
+            LoadState::Unavailable(error) => {
+                return Err(format!("Session storage is unavailable: {error}"))
+            }
+            LoadState::Pending => return Err("The previous session has not been restored.".into()),
         }
         let stage = Builder::new()
             .prefix("buffers-")
@@ -290,6 +379,9 @@ impl SessionStore {
         let mut index = NamedTempFile::new_in(&self.directory).map_err(err)?;
         serde_json::to_writer(&mut index, &saved).map_err(err)?;
         index.flush().map_err(err)?;
+        if index.as_file().metadata().map_err(err)?.len() > MANIFEST_LIMIT {
+            return Err("The session manifest exceeds 16 MiB. The previous checkpoint was retained; save buffers to files and reduce open/closed history.".into());
+        }
         index.as_file().sync_all().map_err(err)?;
         let _kept = stage.keep();
         index

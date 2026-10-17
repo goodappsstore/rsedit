@@ -341,14 +341,24 @@ fn startup_paths(
     Ok(std::mem::take(&mut startup.requests))
 }
 
+#[tauri::command]
+fn pending_open_requests(editor: State<'_, Editor>) -> Result<Vec<OpenRequest>, String> {
+    let mut startup = editor.startup.lock().map_err(|e| e.to_string())?;
+    Ok(std::mem::take(&mut startup.requests))
+}
+
 fn dispatch_open(app: &tauri::AppHandle, requests: Vec<OpenRequest>) {
     if requests.is_empty() {
         return;
     }
     let editor = app.state::<Editor>();
     if let Ok(mut startup) = editor.startup.lock() {
-        if !startup.ready || app.emit("editor-open", &requests).is_err() {
-            startup.requests.extend(requests);
+        startup.requests.extend(requests);
+        if startup.ready {
+            match app.emit("editor-open", &startup.requests) {
+                Ok(()) => startup.requests.clear(),
+                Err(error) => eprintln!("rsedit: could not deliver launch requests: {error}"),
+            }
         }
     };
 }
@@ -521,6 +531,7 @@ pub fn run() {
             scan_search,
             close_document,
             startup_paths,
+            pending_open_requests,
             file_view_ready,
             restore_session,
             persist_session,

@@ -339,7 +339,7 @@ impl Document {
         }
     }
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
-        Self::open_file(id, path, true)
+        Self::open_file(id, path)
     }
     pub fn from_stdin(id: u64, path: &Path) -> Result<Self, String> {
         // Only consume our private spool files, never an arbitrary user file.
@@ -361,19 +361,14 @@ impl Document {
         io::copy(&mut input, &mut buffer).map_err(err)?;
         drop(input);
         drop(cleanup);
-        Self::from_file(id, buffer, None, true)
+        Self::from_file(id, buffer, None)
     }
-    fn open_file(id: u64, path: &Path, validate_small: bool) -> Result<Self, String> {
+    fn open_file(id: u64, path: &Path) -> Result<Self, String> {
         let path = fs::canonicalize(path).map_err(err)?;
         let file = File::open(&path).map_err(err)?;
-        Self::from_file(id, file, Some(path), validate_small)
+        Self::from_file(id, file, Some(path))
     }
-    fn from_file(
-        id: u64,
-        file: File,
-        path: Option<PathBuf>,
-        validate_small: bool,
-    ) -> Result<Self, String> {
+    fn from_file(id: u64, file: File, path: Option<PathBuf>) -> Result<Self, String> {
         let metadata = file.metadata().map_err(err)?;
         if !metadata.is_file() {
             return Err("Choose a regular text file.".into());
@@ -422,7 +417,7 @@ impl Document {
             bom,
             eol: detected_eol(&sample),
         };
-        if !doc.paged && validate_small {
+        if !doc.paged {
             let bytes = doc.read_range(0, size)?;
             reject_binary(&bytes)?;
             std::str::from_utf8(&bytes)
@@ -670,6 +665,7 @@ impl Document {
     }
     /// Resolve a whole-document, one-based location with bounded memory. Columns
     /// use UTF-16 units, matching CodeMirror; never stop inside a UTF-8 scalar.
+    /// Line breaks match CodeMirror's explicit LF/CRLF separator, even in mixed text.
     pub fn location_offset(&mut self, line: u64, col: u64) -> Result<u64, String> {
         if line == 0 || col == 0 {
             return Err("Line and column must be positive.".into());
@@ -960,7 +956,7 @@ impl Document {
                 .path
                 .as_ref()
                 .ok_or("The session has no file or buffer.")?;
-            let mut doc = Self::open_file(id, path, true)?;
+            let mut doc = Self::open_file(id, path)?;
             doc.paged |= saved.paged;
             return Ok(doc);
         };

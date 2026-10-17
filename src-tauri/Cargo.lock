@@ -2790,6 +2790,7 @@ name = "rsedit"
 version = "0.1.7"
 dependencies = [
  "memchr",
+ "rustix",
  "serde",
  "serde_json",
  "tauri",
@@ -2798,6 +2799,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -280,8 +280,38 @@ pub fn rename_path(from: String, name: String) -> Result<String, String> {
     }
     let result = path_string(&target)?;
     require_absent(&target)?;
-    fs::rename(&from, &target).map_err(|e| e.to_string())?;
+    rename_no_replace(&from, &target).map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_no_replace(from: &Path, target: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    // Fail if the filesystem cannot enforce exclusivity; never fall back to rename.
+    renameat_with(CWD, from, CWD, target, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn rename_no_replace(from: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: Both paths are NUL-terminated and live for the duration of the call.
+    // Zero flags excludes MOVEFILE_REPLACE_EXISTING, making the rename exclusive.
+    if unsafe { MoveFileExW(from.as_ptr(), target.as_ptr(), 0) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn rename_no_replace(_from: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Renaming without overwriting is unavailable on this platform.",
+    ))
 }
 
 /// Delete a file, symlink, or folder (recursively). The frontend confirms first.

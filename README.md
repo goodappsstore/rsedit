@@ -77,6 +77,8 @@ and folders, rename, permanently delete with confirmation, copy the path, or
 reveal it in the system file manager. Open buffers track renames; deleting a
 file closes its clean tabs but keeps edited buffers, which offer Save As to
 survive.
+Creating or renaming an entry never replaces an existing destination. Renames
+fail if the filesystem cannot enforce this.
 
 **Mod+\\** (or View → Split Editor Right) shows a second file beside the
 current one. Click either side to focus it; menu actions, search panels, page
@@ -128,6 +130,10 @@ input once. For a file literally named `-`, use `./-`. Invalid paths and unsuppo
 text are reported in the editor. Use `--` before paths beginning with a dash;
 `-- -` opens a literal file named `-`.
 
+When no instance is running, a CLI launch stays in the foreground until the
+editor quits, including when opening stdin. Launches that reuse a running
+instance return after handing off their requests.
+
 ## Keyboard shortcuts
 
 `Mod` means `Cmd` on macOS and `Ctrl` on Windows/Linux.
@@ -151,7 +157,7 @@ text are reported in the editor. Use `--` before paths beginning with a dash;
 | Duplicate line up / down | Alt+Shift+Up / Alt+Shift+Down |
 | Move line up / down | Alt+Up / Alt+Down |
 | Delete line | Mod+Shift+K |
-| Find/replace in visible view only (huge files) | Mod+H |
+| Find/replace in visible view only (huge files) | Cmd+Option+F (macOS), Ctrl+H (Windows/Linux) |
 | Add cursor above / below | Mod+Alt+Up / Mod+Alt+Down |
 | Go to line | Mod+G |
 | Toggle comment | Mod+/ |
@@ -182,7 +188,8 @@ bytes retained exactly. The toolbar moves between views or jumps to a byte offse
   when flushed for navigation, recovery, save, whole-file operations, or undo.
   Ordinary files retain CodeMirror's typing history. Restart starts fresh history.
 - Line numbers, go to line, selections, and multiple cursors remain relative to
-  the **visible view**. **Mod+H** explicitly opens view-only regex find/replace;
+  the **visible view**. **Cmd+Option+F** on macOS or **Ctrl+H** on Windows/Linux
+  explicitly opens view-only regex find/replace;
   its scope is displayed, including the scope of Replace all. Whole-file regex
   replacement and continuous scrolling across huge-file views are not supported.
 - Extremely long lines use plain text. Views may lack preceding multiline syntax

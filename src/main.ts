@@ -142,6 +142,13 @@ function remember(path: string | null): void {
 function dirty(tab: Tab): boolean {
   return !tab.info.paged && tab.savedDoc ? !tab.state.doc.eq(tab.savedDoc) : tab.pending || tab.info.dirty;
 }
+// Keep in sync with custom native menu accelerators in lib.rs.
+const nativeShortcuts = new Set([
+  'Mod-n', 'Mod-o', 'Mod-Alt-o', 'Mod-s', 'Mod-Shift-s', 'Mod-w',
+  'Mod-Shift-t', 'Mod-z', 'Mod-Shift-z', 'Mod-f', 'Mod-Shift-p', 'Mod-Shift-w', 'Mod-q',
+]);
+// Consume native bindings in CodeMirror too, including keyboard-layout
+// fallbacks whose DOM key is not a Latin letter.
 const shortcuts = keymap.of([
   { key: 'Mod-z', run: () => { void safely(() => history(false)); return true; } },
   { key: 'Mod-Shift-z', run: () => { void safely(() => history(true)); return true; } },
@@ -154,7 +161,7 @@ const shortcuts = keymap.of([
   { key: 'Mod-Shift-t', run: () => { void safely(reopenClosedTab); return true; } },
   { key: 'Mod-w', run: () => { void safely(() => closeTab(active)); return true; } },
   { key: 'Mod-f', run: () => { find(); return true; } },
-  { key: 'Mod-h', run: () => { openSectionSearch(); return true; } },
+  { key: mac ? 'Mod-Alt-f' : 'Mod-h', run: () => { openSectionSearch(); return true; } },
   { key: 'Mod-Shift-p', run: () => { showCommands(); return true; } },
   { key: 'Mod-p', run: () => { showFiles(); return true; } },
   { key: 'Mod-g', run: () => { gotoLine(view); return true; } },
@@ -168,7 +175,7 @@ const shortcuts = keymap.of([
   { key: 'Mod--', run: () => { zoom(-1); return true; } },
   { key: 'Mod-0', run: () => { preferences.fontSize = 14; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); return true; } },
   { key: 'Escape', run: () => { if (!largeSearch.hidden) { closeLargeSearch(); return true; } if (searchPanelOpen(view.state)) { closeSectionSearch(); return true; } return false; } },
-]);
+].map(binding => desktop && nativeShortcuts.has(binding.key) ? { ...binding, run: () => true } : binding));
 interface Pane {
   element: HTMLElement;
   host: HTMLElement;
@@ -1276,7 +1283,7 @@ function commands(): Command[] {
     { label: 'Previous tab', shortcut: `${mod}⇧[`, run: () => cycleTab(-1) },
     { label: 'Next tab', shortcut: `${mod}⇧]`, run: () => cycleTab(1) },
     { label: active?.info.paged ? 'Find / replace literal text in entire file' : 'Find / replace in entire file', shortcut: `${mod}F`, run: find },
-    ...(active?.info.paged ? [{ label: 'Find / replace in visible view only', shortcut: `${mod}H`, run: () => { openSectionSearch(); } }] : []),
+    ...(active?.info.paged ? [{ label: 'Find / replace in visible view only', shortcut: mac ? '⌘⌥F' : `${mod}H`, run: () => { openSectionSearch(); } }] : []),
     { label: active?.info.paged ? 'Go to line (visible view)' : 'Go to line', shortcut: `${mod}G`, run: () => { gotoLine(view); } },
     { label: 'Undo', shortcut: `${mod}Z`, run: () => history(false) },
     { label: 'Redo', shortcut: `${mod}⇧Z`, run: () => history(true) },
@@ -1508,6 +1515,17 @@ overlay.addEventListener('keydown', event => {
   const index = focusable.indexOf(document.activeElement as HTMLElement);
   event.preventDefault(); focusable[(index + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length]?.focus();
 });
+// Native menu accelerators own these shortcuts on desktop. Some webviews also
+// deliver their keydown; stop it before CodeMirror, controls, or app handlers act.
+document.addEventListener('keydown', event => {
+  if (!desktop || !(mac ? event.metaKey : event.ctrlKey) || (mac ? event.ctrlKey : event.metaKey)) return;
+  const key = event.altKey && event.code === 'KeyO' ? 'o' : event.key.toLowerCase();
+  const shortcut = `Mod-${event.altKey ? 'Alt-' : ''}${event.shiftKey ? 'Shift-' : ''}${key}`;
+  if (nativeShortcuts.has(shortcut)) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+}, true);
 // App shortcuts also work while folder and search controls have focus.
 document.addEventListener('keydown', event => {
   if (event.defaultPrevented || !overlay.hidden || !(mac ? event.metaKey : event.ctrlKey)) return;
@@ -1645,7 +1663,14 @@ async function initializeDesktop(): Promise<void> {
     const tab = tabs.find(tab => tab.info.id === progress.id);
     if (tab && tab === active && tab.busy) notify(`Processing the entire file: ${progress.total ? Math.floor(progress.done / progress.total * 100) : 100}% (${formatBytes(progress.done)} of ${formatBytes(progress.total)}). You can switch tabs.`);
   });
-  await nativeWindow.onFocusChanged(event => { if (event.payload) void safely(checkExternalChanges); });
+  const drainLaunchRequests = async (): Promise<void> => {
+    if (!launchReady || shuttingDown) return;
+    const requests = await call<OpenRequest[]>('pending_open_requests');
+    if (requests.length) await enqueueLaunchRequests(requests);
+  };
+  await nativeWindow.onFocusChanged(event => {
+    if (event.payload) void safely(async () => { await drainLaunchRequests(); await checkExternalChanges(); });
+  });
   await listen<string>('editor-menu' , event => {
     const action = event.payload;
     if (action === 'quit') void nativeWindow.close();
@@ -1687,7 +1712,8 @@ async function initializeDesktop(): Promise<void> {
   launchReady = true;
   await enqueueLaunchRequests(pendingLaunchRequests.splice(0));
   view.focus();
-  setInterval(() => { void checkpoint(); }, 30_000);
+  // Retry launch handoffs even if an event failed while the window stayed focused.
+  setInterval(() => { void safely(drainLaunchRequests); void checkpoint(); }, 30_000);
   setTimeout(() => { void checkpoint(); void safely(checkExternalChanges); }, 1000);
 }
 storePreferences();

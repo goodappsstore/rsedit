@@ -174,9 +174,6 @@ const shortcuts = keymap.of([
   { key: 'Mod-Shift-]', run: () => { cycleTab(1); return true; } },
   { key: 'Ctrl-Tab', run: () => { cycleTab(1); return true; } },
   { key: 'Ctrl-Shift-Tab', run: () => { cycleTab(-1); return true; } },
-  { key: 'Mod-=', run: () => { zoom(1); return true; } },
-  { key: 'Mod--', run: () => { zoom(-1); return true; } },
-  { key: 'Mod-0', run: () => { preferences.fontSize = 14; storePreferences(); for (const pane of panes) pane.view.requestMeasure(); return true; } },
   { key: 'Escape', run: () => { if (!largeSearch.hidden) { closeLargeSearch(); return true; } if (searchPanelOpen(view.state)) { closeSectionSearch(); return true; } return false; } },
 ].map(binding => desktop && nativeShortcuts.has(binding.key) ? { ...binding, run: () => true } : binding));
 interface Pane {
@@ -1236,7 +1233,14 @@ async function convertIndent(tabsMode: boolean): Promise<void> {
   if (active === tab) setIndent(tabsMode ? '\t' : ' '.repeat(width), width);
   else { tab.indent = tabsMode ? '\t' : ' '.repeat(width); applyEffect(tab, indentSlot.reconfigure([indentUnit.of(tab.indent), EditorState.tabSize.of(width)])); }
 }
-function zoom(delta: number): void { preferences.fontSize = Math.min(28, Math.max(10, preferences.fontSize + delta)); storePreferences(); for (const pane of panes) pane.view.requestMeasure(); }
+function setFontSize(size: number): void {
+  preferences.fontSize = Math.min(28, Math.max(10, size));
+  storePreferences();
+  for (const pane of panes) pane.view.requestMeasure();
+}
+function increaseFontSize(): void { setFontSize(preferences.fontSize + 1); }
+function decreaseFontSize(): void { setFontSize(preferences.fontSize - 1); }
+function resetFontSize(): void { setFontSize(14); }
 function setTheme(id: string): void {
   themePreviewOriginal = undefined;
   preferences.theme = normalizeThemeId(id);
@@ -1327,8 +1331,9 @@ function commands(): Command[] {
     { label: `Next theme (current: ${getTheme(preferences.theme).label})`, run: nextTheme },
     { label: 'Select theme…', run: showThemes },
     { label: 'Set or convert indentation for this file…', run: changeIndent },
-    { label: 'Increase font size', shortcut: `${mod}+`, run: () => zoom(1) },
-    { label: 'Decrease font size', shortcut: `${mod}−`, run: () => zoom(-1) },
+    { label: 'Increase font size', shortcut: `${mod}+`, run: increaseFontSize },
+    { label: 'Decrease font size', shortcut: `${mod}−`, run: decreaseFontSize },
+    { label: 'Reset font size', shortcut: `${mod}0`, run: resetFontSize },
     { label: 'Select syntax language…', run: showLanguages },
     { label: 'Split editor right', shortcut: `${mod}\\`, run: splitRight },
     { label: 'Focus other pane', run: focusOtherPane },
@@ -1470,6 +1475,7 @@ const actions: Record<string, () => void | Promise<void>> = {
   new: newTab, open: openFiles, reopen: reopenClosedTab, save: async () => { await saveTab(active); }, find,
   'open-folder': folders.open, 'toggle-folder': folders.toggle, 'refresh-folder': folders.refresh, 'close-folder': folders.close,
   palette: showCommands, wrap: toggleWrap, indent: changeIndent, language: showLanguages,
+  'increase-font-size': increaseFontSize, 'decrease-font-size': decreaseFontSize, 'reset-font-size': resetFontSize,
   split: () => { if (secondaryPane) closeSplit(); else splitRight(); },
   'focus-other': focusOtherPane, 'move-to-other': moveTabToOtherPane, 'close-split': closeSplit,
 };
@@ -1544,6 +1550,19 @@ overlay.addEventListener('keydown', event => {
   const index = focusable.indexOf(document.activeElement as HTMLElement);
   event.preventDefault(); focusable[(index + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length]?.focus();
 });
+// Own font shortcuts here so + (including Shift+=), =, and numpad keys work
+// from the editor, search controls, folder panel, and command palette alike.
+document.addEventListener('keydown', event => {
+  if (event.defaultPrevented || event.isComposing || event.altKey || shuttingDown
+    || !(mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)) return;
+  const action = event.key === '+' || event.key === '=' ? increaseFontSize
+    : event.key === '-' ? decreaseFontSize
+    : event.key === '0' && !event.shiftKey ? resetFontSize : undefined;
+  if (!action) return;
+  event.preventDefault();
+  event.stopPropagation();
+  action();
+}, true);
 // Native menu accelerators own these shortcuts on desktop. Some webviews also
 // deliver their keydown; stop it before CodeMirror, controls, or app handlers act.
 document.addEventListener('keydown', event => {

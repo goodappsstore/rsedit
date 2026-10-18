@@ -436,6 +436,11 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .text("select-theme", "Select Theme…")
         .text("toggle-folder", "Toggle Folder Panel")
         .separator()
+        // Font shortcuts are handled by the frontend across keyboard layouts.
+        .text("increase-font-size", "Increase Font Size")
+        .text("decrease-font-size", "Decrease Font Size")
+        .text("reset-font-size", "Reset Font Size")
+        .separator()
         .text("split", "Split Editor Right")
         .text("focus-other", "Focus Other Pane")
         .text("move-to-other", "Move Current Tab to Other Pane")

@@ -97,6 +97,12 @@ and close buttons on active or hovered tabs. Middle-click a tab to close it.
 The command palette is available from
 **View → Command Palette** or **Mod+Shift+P**.
 
+Adjust the editor font with **Mod++** (or **Mod+=**) and **Mod+-**; **Mod+0**
+resets it to 14 px. These shortcuts work throughout the window, including search
+and the command palette. **View → Increase Font Size / Decrease Font Size /
+Reset Font Size** provides the same controls. Font size is saved between launches
+and applies to both editor panes, within a range of 10–28 px.
+
 Click the indentation indicator to choose spaces or literal tabs for the current
 file, or to convert its leading indentation. Detection samples the first 64 KiB;
 ambiguous or mixed indentation may need an explicit choice. Changing the setting
@@ -164,7 +170,8 @@ instance return after handing off their requests.
 | Go to line | Mod+G |
 | Toggle comment | Mod+/ |
 | Toggle wrap | Mod+Shift+W |
-| Font size / Reset | Mod+plus / Mod+minus / Mod+0 |
+| Increase / Decrease font size | Mod++ (or Mod+=) / Mod+- |
+| Reset font size | Mod+0 |
 
 ## Large files and performance
 

@@ -92,7 +92,9 @@ The window remembers its last size, position, and maximized or full-screen mode
 across launches. Word wrap remembers your preference; toggle it from
 **View → Word Wrap** or **Mod+Shift+W**. The native menu uses the system menu bar
 on macOS and the window menu bar on Windows/Linux. File tabs sit directly above
-the editor without a separate toolbar; the command palette is available from
+the editor in a rounded, browser-style strip, with a **+** button for new files
+and close buttons on active or hovered tabs. Middle-click a tab to close it.
+The command palette is available from
 **View → Command Palette** or **Mod+Shift+P**.
 
 Click the indentation indicator to choose spaces or literal tabs for the current
@@ -234,7 +236,9 @@ unsaved tab closes still ask. Tabs retain position and language choice; ordinary
 small files restore into memory, while huge files keep bounded disk-backed views.
 Undo history starts fresh after restart.
 Clean tabs whose source files have moved or been deleted are silently skipped
-and removed from the saved session.
+and removed from the saved session. Restoring a saved view yields to new clicks,
+edits, or scrolling, and automatic disk reloads preserve the cursor and viewport
+where the updated content allows.
 
 Session copies are separate from your files. Use **Save** or **Save As** to
 write edits to disk. Recovery data lives in the app data directory's `session/`

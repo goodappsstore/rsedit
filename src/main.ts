@@ -72,7 +72,10 @@ app.innerHTML = `
     </aside>
     <div class="folder-divider" role="separator" aria-label="Folder panel width" aria-orientation="vertical" aria-valuemin="140" aria-valuemax="600" aria-valuenow="220" tabindex="0" hidden></div>
     <div class="editor-pane">
-  <nav class="tabs" aria-label="Open files" role="tablist"></nav>
+  <div class="tabstrip">
+    <nav class="tabs" aria-label="Open files" role="tablist"></nav>
+    <button class="new-tab" data-action="new" title="New file" aria-label="New file">+</button>
+  </div>
   <div class="notice" role="status" hidden><span></span><button aria-label="Dismiss notification">×</button></div>
   <main class="workspace">
     <div class="pagebar" hidden>
@@ -181,6 +184,7 @@ interface Pane {
   host: HTMLElement;
   searchHost: HTMLElement;
   view: EditorView;
+  interactionVersion: number;
   tab?: Tab;
 }
 const panes: Pane[] = [];
@@ -207,7 +211,7 @@ function makePane(): Pane {
   searchHost.hidden = panes.length > 0;
   searchDock.append(searchHost);
   const pane: Pane = {
-    element, host, searchHost,
+    element, host, searchHost, interactionVersion: 0,
     view: new EditorView({
       parent: host,
       state: EditorState.create({
@@ -219,6 +223,9 @@ function makePane(): Pane {
       }),
     }),
   };
+  for (const event of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
+    pane.view.dom.addEventListener(event, () => { pane.interactionVersion++; }, { capture: true, passive: true });
+  }
   pane.view.dom.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
   searchHost.addEventListener('input', commitSectionQuery);
   searchHost.addEventListener('compositionend', commitSectionQuery);
@@ -230,6 +237,7 @@ function paneOfTab(tab: Tab): Pane | undefined {
   return panes.find(pane => pane.tab === tab);
 }
 function showInPane(tab: Tab, pane: Pane): void {
+  pane.interactionVersion++;
   pane.tab = tab;
   tab.state = tab.state.update({ effects: panelSlot.reconfigure(panels({ bottomContainer: pane.searchHost })) }).state;
   pane.view.setState(tab.state);
@@ -502,8 +510,15 @@ function applySavedView(tab: Tab, saved: TabView): void {
   const shown = paneOfTab(tab);
   if (shown) {
     shown.view.dispatch({ selection });
+    const restoredSelection = shown.view.state.selection;
+    const restoredDoc = shown.view.state.doc;
+    const interactionVersion = shown.interactionVersion;
     shown.view.requestMeasure({ read: () => null, write: () => {
-      if (paneOfTab(tab) === shown) { shown.view.scrollDOM.scrollTop = tab.scrollTop; shown.view.scrollDOM.scrollLeft = tab.scrollLeft; }
+      // A click, edit, scroll, or tab switch supersedes deferred restoration.
+      if (paneOfTab(tab) !== shown || shown.view.state.selection !== restoredSelection || shown.view.state.doc !== restoredDoc
+        || shown.interactionVersion !== interactionVersion) return;
+      shown.view.scrollDOM.scrollTop = saved.scrollTop;
+      shown.view.scrollDOM.scrollLeft = saved.scrollLeft;
     } });
   } else tab.state = tab.state.update({ selection }).state;
   renderTabs(); renderStatus();
@@ -609,22 +624,28 @@ function updateDirtyMark(tab: Tab): void {
 function renderTabs(): void {
   folders.select(active?.info.path ?? null);
   tabbar.replaceChildren(...tabs.map(tab => {
-    const node = document.createElement('button');
+    const item = document.createElement('div');
     const shown = paneOfTab(tab);
-    node.className = `tab${tab === active ? ' active' : ''}${shown && tab !== active ? ' secondary' : ''}`;
-    node.dataset.tab = String(tab.info.id);
+    item.className = `tab-item${tab === active ? ' active' : ''}${shown && tab !== active ? ' secondary' : ''}`;
+    item.dataset.tab = String(tab.info.id);
+    item.setAttribute('role', 'presentation');
+    const node = document.createElement('button');
+    node.className = 'tab';
     node.setAttribute('role', 'tab');
     node.setAttribute('aria-selected', String(tab === active));
     node.tabIndex = tab === active ? 0 : -1;
     node.title = tab.info.path ?? tab.info.name;
     const label = document.createElement('span'); label.className = 'tab-label'; label.textContent = tab.info.name;
     const dot = document.createElement('span'); dot.className = 'dirty-mark'; dot.textContent = dirty(tab) ? '●' : ''; dot.setAttribute('aria-label', dirty(tab) ? 'Unsaved changes' : 'Saved');
-    const close = document.createElement('span'); close.className = 'tab-close'; close.textContent = '×'; close.setAttribute('aria-hidden', 'true');
-    close.addEventListener('click', event => { event.stopPropagation(); void safely(() => closeTab(tab)); });
-    node.append(label, dot, close);
+    const close = document.createElement('button'); close.className = 'tab-close'; close.textContent = '×'; close.tabIndex = -1;
+    close.setAttribute('aria-label', `Close ${tab.info.name}`); close.title = `Close ${tab.info.name}`;
+    close.addEventListener('click', () => { void safely(() => closeTab(tab)); });
+    node.append(label, dot);
     node.addEventListener('click', () => activate(tab));
-    node.addEventListener('auxclick', event => { if (event.button === 1) { event.preventDefault(); void safely(() => closeTab(tab)); } });
-    return node;
+    item.addEventListener('mousedown', event => { if (event.button === 1) event.preventDefault(); });
+    item.addEventListener('auxclick', event => { if (event.button === 1) { event.preventDefault(); void safely(() => closeTab(tab)); } });
+    item.append(node, close);
+    return item;
   }));
   tabbar.querySelector('.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   updateTitle();
@@ -914,12 +935,20 @@ async function reloadTab(tab = active): Promise<void> {
   if (!tab?.info.path) return;
   await locked(tab, async () => {
     if (!await approveDiscard(tab)) return;
-    const page = await call<Page>('open_document', { path: tab.info.path });
-    await call('close_document', { id: tab.info.id });
+    let page = await call<Page>('open_document', { path: tab.info.path });
+    try {
+      if (page.info.paged && tab.pageStart) page = await call<Page>('read_page', { id: page.info.id, offset: tab.pageStart });
+      await call('close_document', { id: tab.info.id });
+    } catch (error) {
+      await call('close_document', { id: page.info.id });
+      throw error;
+    }
     hideLargeSearch();
+    const saved = captureTabView(tab);
     tab.previous = []; tab.externalToken = undefined;
     Object.assign(tab, detectIndent(page.text));
     installPage(tab, page);
+    applySavedView(tab, saved);
     notify(`Reloaded ${tab.info.name} from disk.`);
   });
 }

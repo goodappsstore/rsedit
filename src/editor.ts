@@ -1,4 +1,4 @@
-import { Compartment, EditorState, Prec, StateEffect, StateField } from '@codemirror/state';
+import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
 import type { Extension } from '@codemirror/state';
 import { Decoration, EditorView, drawSelection, dropCursor, highlightActiveLine, highlightActiveLineGutter, highlightSpecialChars, keymap, lineNumbers, rectangularSelection, placeholder } from '@codemirror/view';
 import type { DecorationSet, ViewUpdate } from '@codemirror/view';
@@ -8,6 +8,7 @@ import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { search, searchKeymap, highlightSelectionMatches, searchPanelOpen } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
 import type { Page } from './api';
+import { createSearchPanel } from './search-panel';
 
 export const languageSlot = new Compartment();
 export const wrapSlot = new Compartment();
@@ -69,12 +70,10 @@ const theme = EditorView.theme({
   '::selection': { backgroundColor: 'var(--selection)', color: 'var(--selection-text)' },
   '.cm-content .cm-selectedText, .cm-content .cm-selectedText *': { color: 'var(--selection-text)', backgroundColor: 'transparent' },
   '.cm-panels': { backgroundColor: 'var(--panel)', color: 'var(--text)', borderColor: 'var(--border)' },
-  '.cm-search': { padding: '10px 14px' },
-  '.cm-search label': { marginLeft: '8px' },
   '.cm-textfield': { backgroundColor: 'var(--editor)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', padding: '5px 7px' },
   '.cm-button': { backgroundImage: 'none', backgroundColor: 'var(--raised)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', padding: '4px 8px' },
-  '.cm-searchMatch': { backgroundColor: '#d5a55b35' },
-  '.cm-searchMatch-selected': { backgroundColor: '#d5a55b80', outline: '1px solid var(--accent)', borderRadius: '2px' },
+  '.cm-searchMatch': { backgroundColor: 'color-mix(in srgb, var(--accent) 22%, transparent)' },
+  '.cm-searchMatch-selected': { backgroundColor: 'color-mix(in srgb, var(--accent) 42%, var(--editor))', outline: '1px solid var(--accent)', borderRadius: '2px' },
   '.cm-foldPlaceholder': { backgroundColor: 'var(--raised)', borderColor: 'var(--border)', color: 'var(--muted)' },
   '.cm-tooltip': { backgroundColor: 'var(--panel)', borderColor: 'var(--border)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
@@ -85,7 +84,6 @@ export interface EditorOptions {
   indent: string;
   tabSize: number;
   changed: (update: ViewUpdate) => void;
-  shortcuts: Extension;
 }
 export function makeState(page: Page, options: EditorOptions): EditorState {
   return EditorState.create({
@@ -115,8 +113,7 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
         }),
       ]),
       panelSlot.of([]),
-      search({ top: false, scrollToMatch: range => EditorView.scrollIntoView(range, { x: 'center', y: 'center', xMargin: 32, yMargin: 40 }) }),
-      Prec.highest(options.shortcuts),
+      search({ top: false, createPanel: createSearchPanel, scrollToMatch: range => EditorView.scrollIntoView(range, { x: 'center', y: 'center', xMargin: 32, yMargin: 40 }) }),
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, ...searchKeymap, indentWithTab]),
       placeholder('Start typing, or open a file.'),
       EditorView.updateListener.of(options.changed),

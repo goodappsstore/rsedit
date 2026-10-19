@@ -341,6 +341,24 @@ impl Document {
     pub fn open(id: u64, path: &Path) -> Result<Self, String> {
         Self::open_file(id, path)
     }
+    pub fn open_or_new(id: u64, path: &Path) -> Result<Self, String> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Self::open_file(id, path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = fs::canonicalize(path.parent().ok_or("Invalid file directory.")?)
+                    .map_err(err)?;
+                if !parent.is_dir() {
+                    return Err("Choose an existing directory for the new file.".into());
+                }
+                let mut doc = Self::empty(id);
+                doc.path = Some(parent.join(path.file_name().ok_or("Invalid filename.")?));
+                doc.dirty = true;
+                doc.saved_version = None;
+                Ok(doc)
+            }
+            Err(error) => Err(err(error)),
+        }
+    }
     pub fn from_stdin(id: u64, path: &Path) -> Result<Self, String> {
         // Only consume our private spool files, never an arbitrary user file.
         if !path
@@ -481,9 +499,17 @@ impl Document {
         Ok(())
     }
     fn check_original(&self) -> Result<(), String> {
-        if let (Some(path), Some(stamp)) = (&self.path, &self.stamp) {
-            if &Stamp::read(path)? != stamp {
-                return Err("This file changed on disk. Keep your buffer and use Save As, or reload from disk. Disk-backed content cannot be read safely after an external change; copy visible pending edits before reloading.".into());
+        if let Some(path) = &self.path {
+            if let Some(stamp) = &self.stamp {
+                if &Stamp::read(path)? != stamp {
+                    return Err("This file changed on disk. Keep your buffer and use Save As, or reload from disk. Disk-backed content cannot be read safely after an external change; copy visible pending edits before reloading.".into());
+                }
+            } else {
+                match fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(err(error)),
+                    Ok(_) => return Err("A file now exists at this new buffer's path. Use Save As to keep your changes without overwriting it.".into()),
+                }
             }
         }
         Ok(())
@@ -1000,6 +1026,9 @@ impl Document {
         let requested = target
             .or_else(|| self.path.clone())
             .ok_or("Choose a path using Save As.")?;
+        if self.path.as_ref() == Some(&requested) {
+            self.check_original()?;
+        }
         let target = if requested.exists() {
             fs::canonicalize(&requested).map_err(err)?
         } else {
@@ -1052,8 +1081,14 @@ impl Document {
         if now != target_stamp {
             return Err("The destination changed while saving. Your edits are still available; retry or choose another path.".into());
         }
-        // persist uses an atomic replacement on the same filesystem.
-        let file = temp.persist(&target).map_err(err)?;
+        // A named new buffer must not overwrite a file created after it opened,
+        // including between the final destination check and the actual write.
+        let file = if self.path.as_ref() == Some(&target) && self.stamp.is_none() {
+            temp.persist_noclobber(&target).map_err(err)?
+        } else {
+            // persist uses an atomic replacement on the same filesystem.
+            temp.persist(&target).map_err(err)?
+        };
         self.stamp = Some(Stamp::from_metadata(&file.metadata().map_err(err)?)?);
         self.path = Some(target);
         if self.paged {

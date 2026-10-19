@@ -1,10 +1,10 @@
 import './style.css';
 import { ChangeSet, EditorSelection, EditorState, StateEffect } from '@codemirror/state';
 import type { Text } from '@codemirror/state';
-import { EditorView, keymap, panels, placeholder } from '@codemirror/view';
+import { EditorView, panels, placeholder } from '@codemirror/view';
 import type { ViewUpdate } from '@codemirror/view';
 import { Compartment } from '@codemirror/state';
-import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, setSearchQuery, SearchQuery, gotoLine, selectSelectionMatches } from '@codemirror/search';
+import { openSearchPanel, closeSearchPanel, searchPanelOpen, getSearchQuery, gotoLine, selectSelectionMatches } from '@codemirror/search';
 import { indentUnit } from '@codemirror/language';
 import { undo, redo, toggleComment, selectAll, copyLineDown, moveLineUp, moveLineDown, deleteLine } from '@codemirror/commands';
 import { call, desktop, formatBytes } from './api';
@@ -12,6 +12,9 @@ import type { Info, Page, SearchScan, TabView, RestoredTab, RestoredSession, Ext
 import { currentMatch, detectLanguage, indentSlot, languageSlot, makeState, panelSlot, wrapSlot } from './editor';
 import { THEMES, applyTheme, getTheme, normalizeThemeId } from './themes';
 import { createFolderPanel } from './folders';
+import { searchIcon } from './search-panel';
+import { appShortcut } from './shortcuts';
+import type { ShortcutAction } from './shortcuts';
 
 interface Tab {
   info: Info;
@@ -86,11 +89,19 @@ app.innerHTML = `
       <button data-page="jump">Go</button>
     </div>
     <div class="split-row"></div>
-    <section class="large-search" aria-label="Search entire large file" hidden>
-      <div class="search-row"><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file" maxlength="4096" /><button data-search="start">Search</button><span class="large-match-count match-count" role="status" aria-live="polite">0 matches</span><button data-search="close" aria-label="Close file search">×</button></div>
-      <div class="search-row"><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with (literal text)" /><button data-search="replace-all">Replace all in entire file</button></div>
-      <p class="search-hint">Enter: next · Shift+Enter: previous · Escape: close search. Case-sensitive literal whole-file search and replace. Undo spans the file.</p>
-      
+    <section class="large-search find-panel" aria-label="Search entire large file" hidden>
+      <header class="search-header">
+        <span class="search-heading">${searchIcon('search')}<strong>Find & replace</strong><span class="search-scope-badge">Entire file</span></span>
+        <span class="large-match-count match-count" role="status" aria-live="polite">0 matches</span>
+        <button class="search-close" data-search="close" title="Close search (Escape)" aria-label="Close file search">${searchIcon('close')}</button>
+      </header>
+      <div class="search-layout">
+        <div class="search-field"><span class="search-field-icon">${searchIcon('search')}</span><input class="large-query" aria-label="Search entire file" placeholder="Find exact text across the whole file…" maxlength="4096" autocomplete="off" spellcheck="false" /></div>
+        <div class="search-actions"><button data-search="start">Find next ${searchIcon('down')}</button></div>
+        <div class="search-field"><span class="search-field-icon">${searchIcon('replace')}</span><input class="large-replacement" aria-label="Replacement text for entire file" placeholder="Replace with literal text…" autocomplete="off" spellcheck="false" /></div>
+        <div class="search-actions"><button class="search-primary" data-search="replace-all">Replace all in entire file</button></div>
+      </div>
+      <footer class="search-footer"><span>Case-sensitive · Literal text · Undo across file</span><span><kbd>Enter</kbd> next <span class="search-shortcut"><kbd>⇧ Enter</kbd> previous</span> <kbd>Esc</kbd> close</span></footer>
     </section>
     <div class="search-dock"></div>
   </main>
@@ -145,37 +156,6 @@ function remember(path: string | null): void {
 function dirty(tab: Tab): boolean {
   return !tab.info.paged && tab.savedDoc ? !tab.state.doc.eq(tab.savedDoc) : tab.pending || tab.info.dirty;
 }
-// Keep in sync with custom native menu accelerators in lib.rs.
-const nativeShortcuts = new Set([
-  'Mod-n', 'Mod-o', 'Mod-Alt-o', 'Mod-s', 'Mod-Shift-s', 'Mod-w',
-  'Mod-Shift-t', 'Mod-z', 'Mod-Shift-z', 'Mod-f', 'Mod-Shift-p', 'Mod-Shift-w', 'Mod-q',
-]);
-// Consume native bindings in CodeMirror too, including keyboard-layout
-// fallbacks whose DOM key is not a Latin letter.
-const shortcuts = keymap.of([
-  { key: 'Mod-z', run: () => { void safely(() => history(false)); return true; } },
-  { key: 'Mod-Shift-z', run: () => { void safely(() => history(true)); return true; } },
-  { key: 'Mod-y', run: () => { void safely(() => history(true)); return true; } },
-  { key: 'Mod-n', run: () => { void safely(newTab); return true; } },
-  { key: 'Mod-o', run: () => { void safely(openFiles); return true; } },
-  { key: 'Mod-Alt-o', run: () => { void safely(folders.open); return true; } },
-  { key: 'Mod-s', run: () => { void safely(() => saveTab(active)); return true; } },
-  { key: 'Mod-Shift-s', run: () => { void safely(() => saveTab(active, true)); return true; } },
-  { key: 'Mod-Shift-t', run: () => { void safely(reopenClosedTab); return true; } },
-  { key: 'Mod-w', run: () => { void safely(() => closeTab(active)); return true; } },
-  { key: 'Mod-f', run: () => { find(); return true; } },
-  { key: mac ? 'Mod-Alt-f' : 'Mod-h', run: () => { openSectionSearch(); return true; } },
-  { key: 'Mod-Shift-p', run: () => { showCommands(); return true; } },
-  { key: 'Mod-p', run: () => { showFiles(); return true; } },
-  { key: 'Mod-g', run: () => { gotoLine(view); return true; } },
-  { key: 'Mod-Shift-w', run: () => { toggleWrap(); return true; } },
-  { key: 'Mod-\\', run: () => { if (secondaryPane) closeSplit(); else splitRight(); return true; } },
-  { key: 'Mod-Shift-[', run: () => { cycleTab(-1); return true; } },
-  { key: 'Mod-Shift-]', run: () => { cycleTab(1); return true; } },
-  { key: 'Ctrl-Tab', run: () => { cycleTab(1); return true; } },
-  { key: 'Ctrl-Shift-Tab', run: () => { cycleTab(-1); return true; } },
-  { key: 'Escape', run: () => { if (!largeSearch.hidden) { closeLargeSearch(); return true; } if (searchPanelOpen(view.state)) { closeSectionSearch(); return true; } return false; } },
-].map(binding => desktop && nativeShortcuts.has(binding.key) ? { ...binding, run: () => true } : binding));
 interface Pane {
   element: HTMLElement;
   host: HTMLElement;
@@ -224,8 +204,6 @@ function makePane(): Pane {
     pane.view.dom.addEventListener(event, () => { pane.interactionVersion++; }, { capture: true, passive: true });
   }
   pane.view.dom.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
-  searchHost.addEventListener('input', commitSectionQuery);
-  searchHost.addEventListener('compositionend', commitSectionQuery);
   searchHost.addEventListener('focusin', () => { if (focusedPane !== pane) focusPane(pane, false); });
   panes.push(pane);
   return pane;
@@ -405,7 +383,7 @@ function changed(update: ViewUpdate): void {
   if ((update.selectionSet || update.docChanged) && tab === active) renderStatus();
 }
 function options(tab?: Pick<Tab, 'indent' | 'tabSize'>) {
-  return { wrap: preferences.wrap, indent: tab?.indent ?? ' '.repeat(preferences.indent), tabSize: tab?.tabSize ?? preferences.indent, changed, shortcuts };
+  return { wrap: preferences.wrap, indent: tab?.indent ?? ' '.repeat(preferences.indent), tabSize: tab?.tabSize ?? preferences.indent, changed };
 }
 function detectIndent(text: string): { indent: string; tabSize: number } {
   let tabs = 0;
@@ -679,7 +657,7 @@ function renderStatus(): void {
   updateTitle();
 }
 const opening = new Map<string, Promise<void>>();
-async function openPath(path: string): Promise<void> {
+async function openPath(path: string, createIfMissing = false): Promise<void> {
   const existing = tabs.find(t => t.info.path === path);
   if (existing) { activate(existing); await ensureLoaded(existing); return; }
   const inProgress = opening.get(path);
@@ -691,7 +669,7 @@ async function openPath(path: string): Promise<void> {
   }
   const started = performance.now();
   const operation = (async () => {
-    const page = await call<Page>('open_document', { path });
+    const page = await call<Page>('open_document', { path, createIfMissing });
     const duplicate = tabs.find(t => t.info.path === page.info.path);
     if (duplicate) { await call('close_document', { id: page.info.id }); activate(duplicate); await ensureLoaded(duplicate); return; }
     await addPage(page);
@@ -717,7 +695,7 @@ async function openRequest(request: OpenRequest): Promise<void> {
   if (request.kind === 'error') throw new Error(request.message);
   if (request.kind === 'folder') { await folders.restore({ path: request.path, visible: true }); return; }
   if (request.kind === 'stdin') { await addPage(await call<Page>('open_stdin', { path: request.path })); return; }
-  await openPath(request.path);
+  await openPath(request.path, true);
   const tab = tabs.find(tab => tab.info.path === request.path);
   if (!tab || request.line === null) return;
   await ensureLoaded(tab);
@@ -1004,14 +982,10 @@ function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
       const scope = document.createElement('div');
       scope.className = 'search-scope search-hint';
       scope.textContent = 'Visible view only (including Replace all). Use whole-file search for literal replacement across the file.';
-      panel.prepend(scope);
+      panel.querySelector('.search-layout')!.after(scope);
     }
-    let counter = panel.querySelector<HTMLSpanElement>('.section-match-count');
-    if (!counter) {
-      counter = document.createElement('span'); counter.className = 'section-match-count match-count';
-      counter.setAttribute('role', 'status'); panel.append(counter);
-    }
-    if (!query.valid) { counter.textContent = query.search ? 'Invalid regular expression' : '0 matches'; return; }
+    const counter = panel.querySelector<HTMLSpanElement>('.section-match-count')!;
+    if (!query.valid) { counter.textContent = query.search ? 'Invalid regular expression' : 'Type to search'; return; }
     let count = 0;
     const cursor = query.getCursor(state);
     while (!cursor.next().done) {
@@ -1022,7 +996,7 @@ function updateSectionCount(update?: ViewUpdate, pane?: Pane): void {
         if (generation !== sectionCountGeneration || active !== tab || !counter.isConnected) return;
       }
     }
-    if (generation === sectionCountGeneration) counter.textContent = `${count.toLocaleString()} matches`;
+    if (generation === sectionCountGeneration) counter.textContent = `${count.toLocaleString()} ${count === 1 ? 'match' : 'matches'}`;
   }), 0);
 }
 function openSectionSearch(): void {
@@ -1471,33 +1445,45 @@ function renderPalette(): void {
   filteredCommands[paletteIndex]?.preview?.();
 }
 
+function textControlFocused(): boolean {
+  const target = document.activeElement;
+  return target instanceof HTMLElement && (
+    target.matches('input:not([type=checkbox]):not([type=radio]), textarea')
+    || (target.isContentEditable && !target.closest('.cm-editor'))
+  );
+}
+function focusedHistory(forward: boolean): void | Promise<void> {
+  if (textControlFocused()) {
+    // Menu clicks should undo the focused search/rename/palette input, just as
+    // its native keyboard editing does, instead of editing the document.
+    document.execCommand(forward ? 'redo' : 'undo');
+    return;
+  }
+  return history(forward);
+}
 const actions: Record<string, () => void | Promise<void>> = {
   new: newTab, open: openFiles, reopen: reopenClosedTab, save: async () => { await saveTab(active); }, find,
+  'save-as': async () => { await saveTab(active, true); },
+  close: () => closeTab(active),
+  quit: async () => {
+    if (!desktop) return;
+    const { getCurrentWindow } = await import('@tauri-apps/api/window');
+    await getCurrentWindow().close();
+  },
+  undo: () => focusedHistory(false), redo: () => focusedHistory(true),
+  'find-view': openSectionSearch, 'quick-open': showFiles,
+  'go-to-line': () => { gotoLine(view); },
+  'previous-tab': () => cycleTab(-1), 'next-tab': () => cycleTab(1),
   'open-folder': folders.open, 'toggle-folder': folders.toggle, 'refresh-folder': folders.refresh, 'close-folder': folders.close,
   palette: showCommands, wrap: toggleWrap, indent: changeIndent, language: showLanguages,
   'increase-font-size': increaseFontSize, 'decrease-font-size': decreaseFontSize, 'reset-font-size': resetFontSize,
   split: () => { if (secondaryPane) closeSplit(); else splitRight(); },
   'focus-other': focusOtherPane, 'move-to-other': moveTabToOtherPane, 'close-split': closeSplit,
-};
+} satisfies Record<ShortcutAction, () => void | Promise<void>> & Record<string, () => void | Promise<void>>;
 app.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-action]')?.dataset.action;
   if (action && actions[action]) void safely(actions[action]);
 });
-// The default CodeMirror panel listens to keyup/change. Commit input events too,
-// so paste, cut, clear, and checkbox changes immediately update the same query.
-function commitSectionQuery(event: Event): void {
-  if (shuttingDown || (event instanceof InputEvent && event.isComposing)) return;
-  const pane = panes.find(candidate => candidate.searchHost.contains(event.target as Node)) ?? focusedPane;
-  const target = pane.view;
-  const panel = (event.target as HTMLElement).closest('.cm-search');
-  if (!panel || !searchPanelOpen(target.state)) return;
-  const field = (name: string) => panel.querySelector<HTMLInputElement>(`input[name="${name}"]`)!;
-  const query = new SearchQuery({
-    search: field('search').value, replace: field('replace')?.value ?? getSearchQuery(target.state).replace,
-    caseSensitive: field('case').checked, regexp: field('re').checked, wholeWord: field('word').checked,
-  });
-  if (!query.eq(getSearchQuery(target.state))) target.dispatch({ effects: setSearchQuery.of(query) });
-}
 notice.querySelector('button')!.addEventListener('click', () => { notice.hidden = true; });
 pagebar.addEventListener('click', event => {
   const action = (event.target as HTMLElement).closest<HTMLElement>('[data-page]')?.dataset.page;
@@ -1514,14 +1500,14 @@ largeSearch.addEventListener('click', event => {
   if (action === 'close') closeLargeSearch();
 });
 queryInput.addEventListener('keydown', event => {
-  if (event.key === 'Enter') { event.preventDefault(); void safely(() => searchLarge(event.shiftKey ? -1 : 1)); }
+  if (!event.isComposing && event.key === 'Enter') { event.preventDefault(); void safely(() => searchLarge(event.shiftKey ? -1 : 1)); }
 });
 queryInput.addEventListener('input', () => {
   cancelSearch(); if (active) applyEffect(active, currentMatch.of(null)); element('.large-match-count').textContent = queryInput.value ? 'Searching…' : '0 matches';
   if (queryInput.value) searchTimer = setTimeout(() => void safely(() => searchLarge()), 150);
 });
 document.addEventListener('keydown', event => {
-  if (event.key !== 'Escape' || !overlay.hidden) return;
+  if (event.defaultPrevented || event.isComposing || event.key !== 'Escape' || !overlay.hidden) return;
   if (!largeSearch.hidden) { event.preventDefault(); event.stopPropagation(); closeLargeSearch(); }
   else if (searchPanelOpen(view.state)) { event.preventDefault(); event.stopPropagation(); closeSectionSearch(); }
   else {
@@ -1537,6 +1523,7 @@ paletteQuery.addEventListener('input', () => {
   }
 });
 paletteQuery.addEventListener('keydown', event => {
+  if (event.isComposing) return;
   if (event.key === 'Escape') { event.preventDefault(); closePalette(); }
   if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault(); paletteIndex = (paletteIndex + (event.key === 'ArrowDown' ? 1 : -1) + filteredCommands.length) % (filteredCommands.length || 1); renderPalette();
@@ -1550,44 +1537,22 @@ overlay.addEventListener('keydown', event => {
   const index = focusable.indexOf(document.activeElement as HTMLElement);
   event.preventDefault(); focusable[(index + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length]?.focus();
 });
-// Own font shortcuts here so + (including Shift+=), =, and numpad keys work
-// from the editor, search controls, folder panel, and command palette alike.
+// One capture handler owns application shortcuts on every platform and from
+// every control. Native menus dispatch the same actions without accelerators.
+// CodeMirror keeps its text-editing bindings; native inputs keep their own undo.
 document.addEventListener('keydown', event => {
-  if (event.defaultPrevented || event.isComposing || event.altKey || shuttingDown
-    || !(mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey)) return;
-  const action = event.key === '+' || event.key === '=' ? increaseFontSize
-    : event.key === '-' ? decreaseFontSize
-    : event.key === '0' && !event.shiftKey ? resetFontSize : undefined;
-  if (!action) return;
+  if (shuttingDown) return;
+  const action = appShortcut(event, mac);
+  if (!action || (action === 'quit' && !desktop)) return;
+  if ((action === 'undo' || action === 'redo') && textControlFocused()) return;
   event.preventDefault();
   event.stopPropagation();
-  action();
+  // Repeating navigation, zoom, and history is useful. Repeating file actions
+  // could open duplicate dialogs or close several tabs while a key is held.
+  if (event.repeat && !['previous-tab', 'next-tab', 'undo', 'redo',
+    'increase-font-size', 'decrease-font-size', 'reset-font-size'].includes(action)) return;
+  void safely(actions[action]);
 }, true);
-// Native menu accelerators own these shortcuts on desktop. Some webviews also
-// deliver their keydown; stop it before CodeMirror, controls, or app handlers act.
-document.addEventListener('keydown', event => {
-  if (!desktop || !(mac ? event.metaKey : event.ctrlKey) || (mac ? event.ctrlKey : event.metaKey)) return;
-  const key = event.altKey && event.code === 'KeyO' ? 'o' : event.key.toLowerCase();
-  const shortcut = `Mod-${event.altKey ? 'Alt-' : ''}${event.shiftKey ? 'Shift-' : ''}${key}`;
-  if (nativeShortcuts.has(shortcut)) {
-    event.preventDefault();
-    event.stopPropagation();
-  }
-}, true);
-// App shortcuts also work while folder and search controls have focus.
-document.addEventListener('keydown', event => {
-  if (event.defaultPrevented || !overlay.hidden || !(mac ? event.metaKey : event.ctrlKey)) return;
-  const key = event.altKey && event.code === 'KeyO' ? 'o' : event.key.toLowerCase();
-  if (event.shiftKey && !event.altKey) {
-    // Shifted square brackets may arrive as braces, depending on the keyboard layout.
-    const direction = key === '[' || key === '{' || event.code === 'BracketLeft' ? -1
-      : key === ']' || key === '}' || event.code === 'BracketRight' ? 1 : 0;
-    if (direction) { event.preventDefault(); cycleTab(direction); return; }
-  }
-  const action = key === 'o' ? (event.altKey ? folders.open : openFiles) : key === 'n' ? newTab : key === 's' ? async () => { await saveTab(active, event.shiftKey); }
-    : key === 't' && event.shiftKey ? reopenClosedTab : key === 'w' ? (event.shiftKey ? toggleWrap : () => closeTab(active)) : key === 'p' ? (event.shiftKey ? showCommands : showFiles) : undefined;
-  if (action) { event.preventDefault(); void safely(action); }
-});
 tabbar.addEventListener('keydown', event => {
   if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') { event.preventDefault(); cycleTab(event.key === 'ArrowRight' ? 1 : -1); }
   if (event.key === 'Delete') { event.preventDefault(); void safely(() => closeTab(active)); }
@@ -1721,14 +1686,9 @@ async function initializeDesktop(): Promise<void> {
   });
   await listen<string>('editor-menu' , event => {
     const action = event.payload;
-    if (action === 'quit') void nativeWindow.close();
-    else if (action === 'save-as') void safely(async () => { await saveTab(active, true); });
-    else if (action === 'theme') nextTheme();
+    if (action === 'theme') nextTheme();
     else if (action === 'select-theme') showThemes();
     else if (action.startsWith('theme:')) setTheme(action.slice('theme:'.length));
-    else if (action === 'close') void safely(() => closeTab(active));
-    else if (action === 'undo') void safely(() => history(false));
-    else if (action === 'redo') void safely(() => history(true));
     else if (actions[action]) void safely(actions[action]);
   });
   await listen<OpenRequest[]>('editor-open', event => { void enqueueLaunchRequests(event.payload); });

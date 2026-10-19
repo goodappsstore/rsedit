@@ -77,10 +77,19 @@ fn new_document(editor: State<'_, Editor>) -> Result<Page, String> {
     Ok(page)
 }
 #[tauri::command]
-async fn open_document(editor: State<'_, Editor>, path: String) -> Result<Page, String> {
+async fn open_document(
+    editor: State<'_, Editor>,
+    path: String,
+    create_if_missing: Option<bool>,
+) -> Result<Page, String> {
     let id = editor.id();
     let (doc, page) = tauri::async_runtime::spawn_blocking(move || {
-        let mut doc = Document::open(id, &PathBuf::from(path))?;
+        let path = PathBuf::from(path);
+        let mut doc = if create_if_missing.unwrap_or(false) {
+            Document::open_or_new(id, &path)?
+        } else {
+            Document::open(id, &path)?
+        };
         let page = doc.page(0)?;
         Ok::<_, String>((doc, page))
     })
@@ -392,44 +401,40 @@ fn set_word_wrap_menu(app: tauri::AppHandle, enabled: bool) -> Result<(), String
 
 fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
     use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-    let item = |id: &str, label: &str, accelerator: &str| {
-        MenuItemBuilder::with_id(id, label)
-            .accelerator(accelerator)
-            .build(app)
-    };
+    // Application shortcuts belong to the frontend capture handler. Registering
+    // them here too can swallow webview key events or execute commands twice.
+    // Native text editing and OS menu items keep their standard accelerators.
+    let item = |id: &str, label: &str| MenuItemBuilder::with_id(id, label).build(app);
     let file = SubmenuBuilder::new(app, "File")
-        .item(&item("new", "New File", "CmdOrCtrl+N")?)
-        .item(&item("open", "Open…", "CmdOrCtrl+O")?)
-        .item(&item("open-folder", "Open Folder…", "CmdOrCtrl+Alt+O")?)
+        .item(&item("new", "New File")?)
+        .item(&item("open", "Open…")?)
+        .item(&item("open-folder", "Open Folder…")?)
         .separator()
-        .item(&item("save", "Save", "CmdOrCtrl+S")?)
-        .item(&item("save-as", "Save As…", "CmdOrCtrl+Shift+S")?)
+        .item(&item("save", "Save")?)
+        .item(&item("save-as", "Save As…")?)
         .separator()
-        .item(&item("close", "Close File", "CmdOrCtrl+W")?)
-        .item(&item("reopen", "Reopen Closed File", "CmdOrCtrl+Shift+T")?);
+        .item(&item("close", "Close File")?)
+        .item(&item("reopen", "Reopen Closed File")?);
     #[cfg(not(target_os = "macos"))]
-    let file = file
-        .separator()
-        .item(&item("quit", "Quit rsedit", "CmdOrCtrl+Q")?);
+    let file = file.separator().item(&item("quit", "Quit rsedit")?);
     let file = file.build()?;
     let edit = SubmenuBuilder::new(app, "Edit")
-        .item(&item("undo", "Undo", "CmdOrCtrl+Z")?)
-        .item(&item("redo", "Redo", "CmdOrCtrl+Shift+Z")?)
+        .item(&item("undo", "Undo")?)
+        .item(&item("redo", "Redo")?)
         .separator()
         .cut()
         .copy()
         .paste()
         .select_all()
         .separator()
-        .item(&item("find", "Find / Replace", "CmdOrCtrl+F")?)
+        .item(&item("find", "Find / Replace")?)
         .build()?;
     let view = SubmenuBuilder::new(app, "View")
         .id("view")
-        .item(&item("palette", "Command Palette", "CmdOrCtrl+Shift+P")?)
+        .item(&item("palette", "Command Palette")?)
         .item(
             &CheckMenuItemBuilder::with_id("wrap", "Word Wrap")
                 .checked(true)
-                .accelerator("CmdOrCtrl+Shift+W")
                 .build(app)?,
         )
         .text("theme", "Next Theme")
@@ -456,7 +461,7 @@ fn menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
             .hide_others()
             .show_all()
             .separator()
-            .item(&item("quit", "Quit rsedit", "CmdOrCtrl+Q")?)
+            .item(&item("quit", "Quit rsedit")?)
             .build()?,
     );
     let menu = menu.items(&[&file, &edit, &view]);

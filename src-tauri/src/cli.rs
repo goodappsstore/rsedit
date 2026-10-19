@@ -68,10 +68,23 @@ pub fn path_request(arg: OsString, cwd: &Path) -> OpenRequest {
         (literal, None, None)
     };
     let path = std::fs::canonicalize(&path).unwrap_or(path);
+    // Resolve the parent for new files too, so ./name and symlinked directories
+    // identify the same buffer when another launch reaches the running window.
+    let path = path
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .zip(path.file_name())
+        .map(|(parent, name)| parent.join(name))
+        .unwrap_or(path);
     let name = path.to_string_lossy().into_owned();
     if path.is_dir() && line.is_none() {
         OpenRequest::Folder { path: name }
-    } else if path.is_file() {
+    } else if path.is_file()
+        || (std::fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            && path.parent().is_some_and(Path::is_dir)
+            && path.file_name().is_some())
+    {
         OpenRequest::File {
             path: name,
             line,
@@ -79,7 +92,9 @@ pub fn path_request(arg: OsString, cwd: &Path) -> OpenRequest {
         }
     } else {
         OpenRequest::Error {
-            message: format!("Could not open {name}: choose an existing file or directory."),
+            message: format!(
+                "Could not open {name}: choose a text file or a new filename in an existing directory."
+            ),
         }
     }
 }

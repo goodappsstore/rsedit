@@ -115,6 +115,7 @@ With the rsedit executable on your `PATH`:
 
 ```sh
 rsedit notes.txt                 # Open a file
+rsedit new-file.md               # Start a named file if it does not exist
 rsedit src/main.ts:42            # Go to line 42
 rsedit src/main.ts:42:8          # Go to line 42, column 8
 rsedit .                        # Browse the current directory
@@ -124,7 +125,15 @@ rsedit - < output.txt           # Redirected stdin
 ```
 
 Paths resolve from the invoking shell's working directory, including when a
-window is already open. Quote paths containing spaces. Lines and columns are
+window is already open. A missing file opens as an empty, unsaved buffer with
+the requested filename in its tab and syntax highlighting based on its extension.
+Its parent directory must exist. **Save** creates the file at that path; opening
+it alone does not create a file on disk. Repeated launches focus the same open
+buffer. Named new buffers participate in session recovery. If another process
+creates the file before the first save, rsedit keeps your buffer and asks you to
+use Save As rather than overwrite that file.
+
+Quote paths containing spaces. Lines and columns are
 one-based; columns use UTF-16 units as in the editor, and out-of-range positions
 clamp to the last line or the end of that line. An existing filename containing
 colons takes precedence over location syntax. Locations in huge files scan to
@@ -146,6 +155,10 @@ instance return after handing off their requests.
 
 `Mod` means `Cmd` on macOS and `Ctrl` on Windows/Linux.
 
+Application shortcuts use one handler across the editor, search fields, folder
+panel, and command palette. Menu commands use the same actions. Undo and redo in
+a text field edit that field; in the editor they use the document's history.
+
 | Action | Shortcut |
 | --- | --- |
 | New / Open / Save | Mod+N / Mod+O / Mod+S |
@@ -160,6 +173,7 @@ instance return after handing off their requests.
 | Previous / Next tab | Mod+Shift+[ / Mod+Shift+] |
 | Next / Previous tab (alternate) | Ctrl+Tab / Ctrl+Shift+Tab |
 | Undo / Redo | Mod+Z / Mod+Shift+Z |
+| Redo (alternate) | Ctrl+Y on Windows/Linux |
 | Select next occurrence | Mod+D |
 | Select all occurrences (visible view for huge files) | Mod+Shift+L |
 | Duplicate line up / down | Alt+Shift+Up / Alt+Shift+Down |
@@ -172,6 +186,7 @@ instance return after handing off their requests.
 | Toggle wrap | Mod+Shift+W |
 | Increase / Decrease font size | Mod++ (or Mod+=) / Mod+- |
 | Reset font size | Mod+0 |
+| Quit | Mod+Q |
 
 ## Large files and performance
 

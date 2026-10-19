@@ -14,6 +14,22 @@ export const wrapSlot = new Compartment();
 export const panelSlot = new Compartment();
 export const indentSlot = new Compartment();
 const selectionMatchesSlot = new Compartment();
+// drawSelection paints behind syntax-colored text. Give every selected range
+// a readable foreground, including secondary and rectangular selections.
+const selectedText = Decoration.mark({ class: 'cm-selectedText' });
+function selectionDecorations(state: EditorState): DecorationSet {
+  return Decoration.set(state.selection.ranges
+    .filter(range => !range.empty)
+    .map(range => selectedText.range(range.from, range.to)));
+}
+const selectedTextField = StateField.define<DecorationSet>({
+  create: selectionDecorations,
+  update(decorations, transaction) {
+    return transaction.docChanged || transaction.selection
+      ? selectionDecorations(transaction.state) : decorations;
+  },
+  provide: field => EditorView.outerDecorations.from(field),
+});
 export const currentMatch = StateEffect.define<{ from: number; to: number } | null>();
 const matchField = StateField.define<DecorationSet>({
   create: () => Decoration.none,
@@ -49,14 +65,16 @@ const theme = EditorView.theme({
   '.cm-gutters': { backgroundColor: 'var(--editor)', color: 'var(--muted)', border: 'none', padding: '0 6px 0 12px' },
   '.cm-activeLineGutter, .cm-activeLine': { backgroundColor: 'var(--active-line)' },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
-  '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--selection)' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground': { backgroundColor: 'var(--selection)' },
+  '::selection': { backgroundColor: 'var(--selection)', color: 'var(--selection-text)' },
+  '.cm-content .cm-selectedText, .cm-content .cm-selectedText *': { color: 'var(--selection-text)', backgroundColor: 'transparent' },
   '.cm-panels': { backgroundColor: 'var(--panel)', color: 'var(--text)', borderColor: 'var(--border)' },
   '.cm-search': { padding: '10px 14px' },
   '.cm-search label': { marginLeft: '8px' },
   '.cm-textfield': { backgroundColor: 'var(--editor)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', padding: '5px 7px' },
   '.cm-button': { backgroundImage: 'none', backgroundColor: 'var(--raised)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '4px', padding: '4px 8px' },
   '.cm-searchMatch': { backgroundColor: '#d5a55b35' },
-  '.cm-searchMatch-selected': { backgroundColor: '#d5a55b65' },
+  '.cm-searchMatch-selected': { backgroundColor: '#d5a55b80', outline: '1px solid var(--accent)', borderRadius: '2px' },
   '.cm-foldPlaceholder': { backgroundColor: 'var(--raised)', borderColor: 'var(--border)', color: 'var(--muted)' },
   '.cm-tooltip': { backgroundColor: 'var(--panel)', borderColor: 'var(--border)', color: 'var(--text)' },
   '&.cm-focused': { outline: 'none' },
@@ -77,7 +95,7 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
       // CodeMirror's generated styles; CSP ignores unsafe-inline with a nonce.
       EditorView.cspNonce.of(document.querySelector<HTMLStyleElement>('style[nonce]')?.nonce ?? ''),
       theme, matchField, lineNumbers(), highlightSpecialChars(), history({ minDepth: 100 }),
-      drawSelection(), dropCursor(), rectangularSelection(),
+      drawSelection(), selectedTextField, dropCursor(), rectangularSelection(),
       highlightActiveLine(), highlightActiveLineGutter(),
       EditorState.allowMultipleSelections.of(true),
       // CodeMirror represents lines internally; sliceDoc restores this separator.

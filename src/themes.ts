@@ -20,6 +20,7 @@ export interface Theme {
   border: string;
   accent: string;
   selection: string;
+  selectionText?: string;
   activeLine: string;
   danger: string;
   syntax: ThemeSyntax;
@@ -160,6 +161,7 @@ export const THEMES: Theme[] = [
     border: '#073642',
     accent: '#b58900',
     selection: '#073642',
+    selectionText: '#a8b6b7',
     activeLine: '#ffffff06',
     danger: '#dc322f',
     syntax: {
@@ -184,6 +186,7 @@ export const THEMES: Theme[] = [
     border: '#e0d6b8',
     accent: '#9a7d00',
     selection: '#e2d5ae',
+    selectionText: '#3d4c51',
     activeLine: '#00000005',
     danger: '#dc322f',
     syntax: {
@@ -297,6 +300,7 @@ export function applyTheme(theme: Theme): void {
   root.style.setProperty('--border', theme.border);
   root.style.setProperty('--accent', theme.accent);
   root.style.setProperty('--selection', theme.selection);
+  root.style.setProperty('--selection-text', theme.selectionText ?? theme.text);
   root.style.setProperty('--active-line', theme.activeLine);
   root.style.setProperty('--danger', theme.danger);
   root.style.setProperty('--syntax-keyword', theme.syntax.keyword);

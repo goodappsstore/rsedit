@@ -32,6 +32,7 @@ interface Tab {
   previous: number[];
   scrollTop: number;
   scrollLeft: number;
+  scrollSnapshot?: ReturnType<EditorView['scrollSnapshot']>;
   loaded: boolean;
   savedView?: TabView;
   loading?: Promise<void>;
@@ -211,13 +212,30 @@ function makePane(): Pane {
 function paneOfTab(tab: Tab): Pane | undefined {
   return panes.find(pane => pane.tab === tab);
 }
+function savePaneScroll(pane: Pane): void {
+  const tab = pane.tab;
+  // A rapid switch can leave before CodeMirror has restored the viewport.
+  if (!tab || tab.scrollSnapshot) return;
+  tab.scrollTop = pane.view.scrollDOM.scrollTop;
+  tab.scrollLeft = pane.view.scrollDOM.scrollLeft;
+  tab.scrollSnapshot = pane.view.scrollSnapshot();
+}
 function showInPane(tab: Tab, pane: Pane): void {
   pane.interactionVersion++;
   pane.tab = tab;
   tab.state = tab.state.update({ effects: panelSlot.reconfigure(panels({ bottomContainer: pane.searchHost })) }).state;
   pane.view.setState(tab.state);
-  pane.view.scrollDOM.scrollTop = tab.scrollTop;
-  pane.view.scrollDOM.scrollLeft = tab.scrollLeft;
+  const snapshot = tab.scrollSnapshot;
+  if (snapshot) {
+    // Wrapped line heights are still estimates when CodeMirror rebuilds the view.
+    pane.view.dispatch({ effects: snapshot });
+    pane.view.requestMeasure({ key: pane, read: () => null, write: () => {
+      if (pane.tab === tab && tab.scrollSnapshot === snapshot) tab.scrollSnapshot = undefined;
+    } });
+  } else {
+    pane.view.scrollDOM.scrollTop = tab.scrollTop;
+    pane.view.scrollDOM.scrollLeft = tab.scrollLeft;
+  }
   updateSectionCount(undefined, pane);
 }
 function focusPane(pane: Pane, focusEditor = true): void {
@@ -291,10 +309,7 @@ function makeSplitPane(): Pane {
 function closeSplitPane(pane: Pane): void {
   const index = panes.indexOf(pane);
   if (index === -1 || pane === primaryPane) return;
-  if (pane.tab) {
-    pane.tab.scrollTop = pane.view.scrollDOM.scrollTop;
-    pane.tab.scrollLeft = pane.view.scrollDOM.scrollLeft;
-  }
+  savePaneScroll(pane);
   pane.view.destroy();
   pane.element.remove();
   pane.searchHost.remove();
@@ -334,6 +349,8 @@ function moveTabToOtherPane(): void {
   const source = focusedPane;
   let target = panes.find(pane => pane !== source);
   if (!target) target = makeSplitPane();
+  savePaneScroll(source);
+  savePaneScroll(target);
   if (target.tab) {
     const other = target.tab;
     showInPane(tab, target);
@@ -427,6 +444,7 @@ function installPage(tab: Tab, page: Page): void {
   tab.pending = false;
   tab.loaded = true;
   tab.scrollTop = tab.scrollLeft = 0;
+  tab.scrollSnapshot = undefined;
   const shown = paneOfTab(tab);
   if (shown) { showInPane(tab, shown); if (shown === focusedPane) shown.view.focus(); }
   void loadLanguage(tab);
@@ -471,10 +489,10 @@ function restoredTab(entry: RestoredTab): Tab {
 function captureTabView(tab: Tab): TabView {
   if (!tab.loaded && tab.savedView) return { ...tab.savedView, id: tab.info.id, name: tab.info.name, languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
   const selection = tab.state.selection.main;
-  const shown = paneOfTab(tab);
+  const scrollDOM = tab.scrollSnapshot ? undefined : paneOfTab(tab)?.view.scrollDOM;
   return { id: tab.info.id, name: tab.info.name, pageStart: tab.pageStart, anchor: selection.anchor, head: selection.head,
-    scrollTop: shown ? shown.view.scrollDOM.scrollTop : tab.scrollTop,
-    scrollLeft: shown ? shown.view.scrollDOM.scrollLeft : tab.scrollLeft,
+    scrollTop: scrollDOM?.scrollTop ?? tab.scrollTop,
+    scrollLeft: scrollDOM?.scrollLeft ?? tab.scrollLeft,
     languageOverride: tab.languageOverride ?? null, indent: tab.indent, tabSize: tab.tabSize };
 }
 function applySavedView(tab: Tab, saved: TabView): void {
@@ -534,26 +552,22 @@ function activate(tab: Tab): void {
   if (shown) {
     if (shown !== focusedPane) focusPane(shown);
     else {
-      view.focus();
       renderTabs(); renderStatus();
+      shown.view.focus();
     }
     if (!tab.loaded) void safely(() => ensureLoaded(tab));
     return;
   }
   hideLargeSearch();
   const pane = focusedPane;
-  if (pane.tab) {
-    pane.tab.scrollTop = pane.view.scrollDOM.scrollTop;
-    pane.tab.scrollLeft = pane.view.scrollDOM.scrollLeft;
-  }
+  savePaneScroll(pane);
   active = tab;
   const historyIndex = selectionHistory.indexOf(tab);
   if (historyIndex !== -1) selectionHistory.splice(historyIndex, 1);
   selectionHistory.push(tab);
   showInPane(tab, pane);
-  pane.view.requestMeasure();
-  pane.view.focus();
   renderTabs(); renderStatus();
+  pane.view.focus();
   if (!tab.loaded) void safely(() => ensureLoaded(tab));
 }
 function cycleTab(direction: number): void {
@@ -616,6 +630,7 @@ function renderTabs(): void {
     close.setAttribute('aria-label', `Close ${tab.info.name}`); close.title = `Close ${tab.info.name}`;
     close.addEventListener('click', () => { void safely(() => closeTab(tab)); });
     node.append(label, dot);
+    node.addEventListener('mousedown', event => { if (event.button === 0) event.preventDefault(); });
     node.addEventListener('click', () => activate(tab));
     item.addEventListener('mousedown', event => { if (event.button === 1) event.preventDefault(); });
     item.addEventListener('auxclick', event => { if (event.button === 1) { event.preventDefault(); void safely(() => closeTab(tab)); } });
@@ -838,10 +853,9 @@ function closeTab(tab: Tab | undefined): Promise<void> {
       }
       const shown = paneOfTab(tab);
       if (shown) {
+        savePaneScroll(shown);
         shown.tab = undefined;
         tab.state = shown.view.state;
-        tab.scrollTop = shown.view.scrollDOM.scrollTop;
-        tab.scrollLeft = shown.view.scrollDOM.scrollLeft;
         if (shown === focusedPane) hideLargeSearch();
       }
       if (active === tab) active = undefined;

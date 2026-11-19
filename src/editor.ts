@@ -117,7 +117,8 @@ export function makeState(page: Page, options: EditorOptions): EditorState {
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...foldKeymap, ...searchKeymap, indentWithTab]),
       placeholder('Start typing, or open a file.'),
       EditorView.updateListener.of(options.changed),
-      EditorView.contentAttributes.of({ 'aria-label': 'Text editor', spellcheck: 'false' }),
+      // Preserve keyboard focus while the buffer is temporarily uneditable.
+      EditorView.contentAttributes.of({ 'aria-label': 'Text editor', spellcheck: 'false', tabindex: '0' }),
     ],
   });
 }
